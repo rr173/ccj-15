@@ -38,3 +38,14 @@ def rank_targets(key: str, targets: list[Target]) -> list[Target]:
         scored.append((score, t.id, t))
     scored.sort(key=lambda item: (item[0], item[1]))
     return [t for _, _, t in scored]
+
+
+def gray_bucket(seed: str) -> int:
+    """Deterministic bucket in 0..99 for a seed.
+
+    The seed mixes the config version, the release-group fingerprint
+    (window, labels, percent, targets) and the client key, so a client is
+    stable while nothing changes and is reshuffled the moment any of the
+    inputs move.
+    """
+    return min(99, int(_unit_interval(seed) * 100))

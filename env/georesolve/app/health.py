@@ -164,6 +164,9 @@ class HealthChecker:
         for rule in snap.all_rules():
             for t in rule.targets:
                 targets[t.id] = t.address
+        for group in snap.all_release_groups():
+            for t in group.targets:
+                targets[t.id] = t.address
         if not targets:
             return
         results = await asyncio.gather(

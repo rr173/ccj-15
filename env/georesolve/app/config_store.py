@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .audit import AuditLog
-from .models import ConfigBundle, Defaults, Rule
+from .models import ConfigBundle, Defaults, ReleaseGroup, Rule
 
 
 class VersionConflict(Exception):
@@ -50,6 +50,7 @@ class Snapshot:
     version: int
     defaults: Defaults
     rules: dict  # rule.key() -> tuple[Rule, ...] sorted by rule_version
+    release_groups: dict  # name -> tuple[ReleaseGroup, ...] sorted by (priority, id)
 
     def effective_rule(
         self, name: str, region: str, tenant: str, now: float
@@ -68,10 +69,22 @@ class Snapshot:
                     return rule
         return None
 
+    def groups_for_name(self, name: str) -> tuple[ReleaseGroup, ...]:
+        return self.release_groups.get(name, ())
+
+    def visible_groups(
+        self, name: str, region: str, tenant: str
+    ) -> list[ReleaseGroup]:
+        """Groups of the name whose scope the request can see."""
+        return [
+            g for g in self.groups_for_name(name) if g.visible_to(region, tenant)
+        ]
+
     def next_transition(
         self, name: str, region: str, tenant: str, now: float
     ) -> Optional[float]:
-        """Earliest future effective_from among rules that could apply."""
+        """Earliest future moment the answer may change: scheduled rule
+        activations plus release-group window starts/ends."""
         keys = [(name, "global", "", "")]
         if region:
             keys.append((name, "region", region, ""))
@@ -83,10 +96,18 @@ class Snapshot:
             for r in self.rules.get(k, ())
             if r.effective_from > now
         ]
+        for g in self.visible_groups(name, region, tenant):
+            if g.window_start > now:
+                future.append(g.window_start)
+            elif g.window_active(now):
+                future.append(g.window_end)
         return min(future) if future else None
 
     def all_rules(self) -> list[Rule]:
         return [r for versions in self.rules.values() for r in versions]
+
+    def all_release_groups(self) -> list[ReleaseGroup]:
+        return [g for groups in self.release_groups.values() for g in groups]
 
 
 class ConfigManager:
@@ -103,13 +124,14 @@ class ConfigManager:
         self._version = 0
         self._defaults = Defaults()
         self._rules: dict[tuple, tuple[Rule, ...]] = {}
+        self._groups: dict[str, tuple[ReleaseGroup, ...]] = {}
         self._listeners: list[Callable[[Snapshot], int]] = []
 
     # -- read side ------------------------------------------------------
 
     def snapshot(self) -> Snapshot:
         with self._lock:
-            return Snapshot(self._version, self._defaults, self._rules)
+            return Snapshot(self._version, self._defaults, self._rules, self._groups)
 
     def add_listener(self, fn: Callable[[Snapshot], int]) -> None:
         """fn(new_snapshot) -> number of cache entries invalidated."""
@@ -176,7 +198,32 @@ class ConfigManager:
             if key not in new_rules:
                 changes.append(("removed", key, versions, ()))
 
+        # Release groups are full-state too: the bundle's list replaces the
+        # stored one wholesale (windows, not scheduled versions, drive their
+        # activation, so no merging is needed).
+        grouped: dict[str, list[ReleaseGroup]] = {}
+        for g in bundle.release_groups:
+            grouped.setdefault(g.name, []).append(g)
+        new_groups = {
+            name: tuple(sorted(gs, key=lambda g: (g.priority, g.id)))
+            for name, gs in grouped.items()
+        }
+        old_groups = self._groups
+        group_changes: list[tuple[str, str, Optional[ReleaseGroup], Optional[ReleaseGroup]]] = []
+        for name in sorted(set(old_groups) | set(new_groups)):
+            old_by_id = {g.id: g for g in old_groups.get(name, ())}
+            new_by_id = {g.id: g for g in new_groups.get(name, ())}
+            for gid in sorted(set(old_by_id) | set(new_by_id)):
+                old_g, new_g = old_by_id.get(gid), new_by_id.get(gid)
+                if old_g is None:
+                    group_changes.append(("added", name, None, new_g))
+                elif new_g is None:
+                    group_changes.append(("removed", name, old_g, None))
+                elif old_g.model_dump() != new_g.model_dump():
+                    group_changes.append(("updated", name, old_g, new_g))
+
         self._rules = new_rules
+        self._groups = new_groups
         self._version = bundle.version
         self._defaults = bundle.defaults
 
@@ -203,9 +250,33 @@ class ConfigManager:
                         "new": [r.model_dump() for r in new_v] or None,
                     },
                 )
+            group_counts = {"added": 0, "updated": 0, "removed": 0}
+            for action, name, old_g, new_g in group_changes:
+                group_counts[action] += 1
+                group = new_g or old_g
+                self._audit.record(
+                    "release_group_change",
+                    {
+                        "action": action,
+                        "name": name,
+                        "group_id": group.id if group else None,
+                        "scope": group.scope if group else None,
+                        "config_version": bundle.version,
+                        "source": source,
+                        "old": old_g.model_dump() if old_g else None,
+                        "new": new_g.model_dump() if new_g else None,
+                    },
+                )
             self._audit.record(
                 "config_applied",
-                {"version": bundle.version, "source": source, **counts},
+                {
+                    "version": bundle.version,
+                    "source": source,
+                    **counts,
+                    "release_groups_added": group_counts["added"],
+                    "release_groups_updated": group_counts["updated"],
+                    "release_groups_removed": group_counts["removed"],
+                },
             )
 
         snap = self.snapshot()
@@ -216,5 +287,6 @@ class ConfigManager:
         return {
             "version": bundle.version,
             "changes": len(changes),
+            "release_group_changes": len(group_changes),
             "invalidated": invalidated,
         }

@@ -53,9 +53,17 @@ def rule(
     )
 
 
-def bundle(version: int, rules: list[Rule], negative_ttl: int = 30) -> ConfigBundle:
+def bundle(
+    version: int,
+    rules: list[Rule],
+    negative_ttl: int = 30,
+    release_groups: list | None = None,
+) -> ConfigBundle:
     return ConfigBundle(
-        version=version, defaults=Defaults(negative_ttl=negative_ttl), rules=rules
+        version=version,
+        defaults=Defaults(negative_ttl=negative_ttl),
+        rules=rules,
+        release_groups=release_groups or [],
     )
 
 

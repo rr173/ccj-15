@@ -1,15 +1,17 @@
 """HTTP API and application wiring.
 
 Data plane (unauthenticated, like a DNS resolver):
-  GET /v1/resolve   - resolve a name for a region/tenant
-  GET /v1/explain   - show the rule version, targets and effective time
-                      currently in force for a name/region/tenant
+  GET /v1/resolve   - resolve a name for a region/tenant; optional
+                      `labels=k=v,k2=v2` carries client labels used by
+                      gray release groups
+  GET /v1/explain   - show the rule version, targets, effective time and
+                      the release-group decision for a name/region/tenant
   GET /healthz      - liveness
 
 Control plane (requires Bearer token when GEORESOLVE_ADMIN_TOKEN is set):
-  GET  /v1/config          - current config snapshot
+  GET  /v1/config          - current config snapshot (rules + release groups)
   POST /v1/config          - apply a new config bundle (monotonic version)
-  GET  /v1/audit           - rule changes, cache invalidations, health changes
+  GET  /v1/audit           - rule/group changes, group hits, cache invalidations
   GET  /v1/health/targets  - current target health view
   GET  /v1/cache           - cache contents (debug)
   POST /v1/cache/flush     - drop all cached answers (audited)
@@ -135,6 +137,21 @@ def create_app(components: Components) -> FastAPI:
         if comp.admin_token and authorization != f"Bearer {comp.admin_token}":
             raise HTTPException(status_code=401, detail="invalid or missing admin token")
 
+    def parse_labels(raw: str) -> dict:
+        labels: dict[str, str] = {}
+        for pair in (raw or "").split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"malformed label {pair!r}, expected k=v",
+                )
+            k, v = pair.split("=", 1)
+            labels[k] = v
+        return labels
+
     # -- data plane ------------------------------------------------------
 
     @app.get("/healthz")
@@ -148,9 +165,12 @@ def create_app(components: Components) -> FastAPI:
         region: str = "",
         tenant: str = "",
         client: Optional[str] = None,
+        labels: str = "",
     ):
         client_key = client or (request.client.host if request.client else "")
-        return comp.resolver.resolve(name, region, tenant, client_key)
+        return comp.resolver.resolve(
+            name, region, tenant, client_key, labels=parse_labels(labels)
+        )
 
     @app.get("/v1/explain")
     async def explain(
@@ -159,9 +179,12 @@ def create_app(components: Components) -> FastAPI:
         region: str = "",
         tenant: str = "",
         client: Optional[str] = None,
+        labels: str = "",
     ):
         client_key = client or (request.client.host if request.client else "")
-        return comp.resolver.explain(name, region, tenant, client_key)
+        return comp.resolver.explain(
+            name, region, tenant, client_key, labels=parse_labels(labels)
+        )
 
     # -- control plane ---------------------------------------------------
 
@@ -174,6 +197,12 @@ def create_app(components: Components) -> FastAPI:
             "rules": [
                 r.model_dump()
                 for r in sorted(snap.all_rules(), key=lambda r: (r.key(), r.rule_version))
+            ],
+            "release_groups": [
+                g.model_dump()
+                for g in sorted(
+                    snap.all_release_groups(), key=lambda g: (g.name, g.priority, g.id)
+                )
             ],
         }
 
@@ -206,8 +235,10 @@ def create_app(components: Components) -> FastAPI:
                     "region": e.region,
                     "tenant": e.tenant,
                     "client_key": e.client_key,
+                    "labels_sig": e.labels_sig,
                     "kind": e.kind,
                     "rule_version": e.rule_version,
+                    "group_id": e.group_id,
                     "expires_at": e.expires_at,
                     "config_version": e.config_version,
                 }
