@@ -17,6 +17,11 @@ Semantics:
   removed. When a bundle carries a future-dated rule for a key, the
   previously effective rule for that key is retained until the scheduled
   one activates.
+- Rate-limit tiers are also full-state, grouped by scope layer. Resolution
+  chooses the highest-priority matching tier in the most specific layer
+  (tenant, then region, then global). Applying any new bundle version lets
+  the rate limiter discard old buckets, so quota state never survives a
+  configuration change.
 - Listeners are notified after each apply so the resolver can invalidate
   cache entries whose producing rule changed. Entries for names that did
   not change keep serving until their TTL expires.
@@ -31,7 +36,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .audit import AuditLog
-from .models import ConfigBundle, Defaults, ReleaseGroup, Rule
+from .models import ConfigBundle, Defaults, RateLimitTier, ReleaseGroup, Rule
 
 
 class VersionConflict(Exception):
@@ -51,6 +56,7 @@ class Snapshot:
     defaults: Defaults
     rules: dict  # rule.key() -> tuple[Rule, ...] sorted by rule_version
     release_groups: dict  # name -> tuple[ReleaseGroup, ...] sorted by (priority, id)
+    rate_limit_tiers: dict  # scope_key -> tuple[RateLimitTier, ...] sorted by (priority,id)
 
     def effective_rule(
         self, name: str, region: str, tenant: str, now: float
@@ -109,6 +115,46 @@ class Snapshot:
     def all_release_groups(self) -> list[ReleaseGroup]:
         return [g for groups in self.release_groups.values() for g in groups]
 
+    def rate_limit_for(
+        self, region: str, tenant: str, labels: dict[str, str]
+    ) -> Optional[RateLimitTier]:
+        """Select one highest-priority tier from the most specific layer."""
+        scope_keys: list[tuple] = []
+        if tenant:
+            scope_keys.append(("tenant", "", tenant))
+        if region:
+            scope_keys.append(("region", region, ""))
+        scope_keys.append(("global", "", ""))
+
+        for scope_key in scope_keys:
+            matches = [
+                tier
+                for tier in self.rate_limit_tiers.get(scope_key, ())
+                if tier.labels_match(labels)
+            ]
+            if matches:
+                return min(matches, key=lambda t: (t.priority, t.id))
+        return None
+
+    def rate_limit_candidates(
+        self, region: str, tenant: str
+    ) -> list[RateLimitTier]:
+        """Visible tiers ordered from the most to the least specific layer."""
+        scope_keys: list[tuple] = []
+        if tenant:
+            scope_keys.append(("tenant", "", tenant))
+        if region:
+            scope_keys.append(("region", region, ""))
+        scope_keys.append(("global", "", ""))
+        return [
+            tier
+            for scope_key in scope_keys
+            for tier in self.rate_limit_tiers.get(scope_key, ())
+        ]
+
+    def all_rate_limit_tiers(self) -> list[RateLimitTier]:
+        return [tier for tiers in self.rate_limit_tiers.values() for tier in tiers]
+
 
 class ConfigManager:
     def __init__(
@@ -125,13 +171,16 @@ class ConfigManager:
         self._defaults = Defaults()
         self._rules: dict[tuple, tuple[Rule, ...]] = {}
         self._groups: dict[str, tuple[ReleaseGroup, ...]] = {}
+        self._tiers: dict[tuple, tuple[RateLimitTier, ...]] = {}
         self._listeners: list[Callable[[Snapshot], int]] = []
 
     # -- read side ------------------------------------------------------
 
     def snapshot(self) -> Snapshot:
         with self._lock:
-            return Snapshot(self._version, self._defaults, self._rules, self._groups)
+            return Snapshot(
+                self._version, self._defaults, self._rules, self._groups, self._tiers
+            )
 
     def add_listener(self, fn: Callable[[Snapshot], int]) -> None:
         """fn(new_snapshot) -> number of cache entries invalidated."""
@@ -147,7 +196,13 @@ class ConfigManager:
             if row is None:
                 return None
             bundle = ConfigBundle(**json.loads(row["payload"]))
-            self._install(bundle, persist=False, audit_record=False, source="restore")
+            self._install(
+                bundle,
+                persist=False,
+                audit_record=False,
+                source="restore",
+                notify=False,
+            )
             return bundle.version
 
     def apply(self, bundle: ConfigBundle, source: str = "api") -> dict:
@@ -174,7 +229,12 @@ class ConfigManager:
         return tuple(sorted(versions, key=lambda r: r.rule_version))
 
     def _install(
-        self, bundle: ConfigBundle, persist: bool, audit_record: bool, source: str
+        self,
+        bundle: ConfigBundle,
+        persist: bool,
+        audit_record: bool,
+        source: str,
+        notify: bool = True,
     ) -> dict:
         now = self._clock()
         old_rules = self._rules
@@ -208,6 +268,15 @@ class ConfigManager:
             name: tuple(sorted(gs, key=lambda g: (g.priority, g.id)))
             for name, gs in grouped.items()
         }
+
+        grouped_tiers: dict[tuple, list[RateLimitTier]] = {}
+        for tier in bundle.rate_limit_tiers:
+            grouped_tiers.setdefault(tier.scope_key(), []).append(tier)
+        new_tiers = {
+            scope_key: tuple(sorted(ts, key=lambda t: (t.priority, t.id)))
+            for scope_key, ts in grouped_tiers.items()
+        }
+
         old_groups = self._groups
         group_changes: list[tuple[str, str, Optional[ReleaseGroup], Optional[ReleaseGroup]]] = []
         for name in sorted(set(old_groups) | set(new_groups)):
@@ -222,8 +291,23 @@ class ConfigManager:
                 elif old_g.model_dump() != new_g.model_dump():
                     group_changes.append(("updated", name, old_g, new_g))
 
+        old_tiers = self._tiers
+        tier_changes: list[tuple[str, tuple, Optional[RateLimitTier], Optional[RateLimitTier]]] = []
+        for scope_key in sorted(set(old_tiers) | set(new_tiers)):
+            old_by_id = {t.id: t for t in old_tiers.get(scope_key, ())}
+            new_by_id = {t.id: t for t in new_tiers.get(scope_key, ())}
+            for tid in sorted(set(old_by_id) | set(new_by_id)):
+                old_t, new_t = old_by_id.get(tid), new_by_id.get(tid)
+                if old_t is None:
+                    tier_changes.append(("added", scope_key, None, new_t))
+                elif new_t is None:
+                    tier_changes.append(("removed", scope_key, old_t, None))
+                elif old_t.model_dump() != new_t.model_dump():
+                    tier_changes.append(("updated", scope_key, old_t, new_t))
+
         self._rules = new_rules
         self._groups = new_groups
+        self._tiers = new_tiers
         self._version = bundle.version
         self._defaults = bundle.defaults
 
@@ -267,6 +351,22 @@ class ConfigManager:
                         "new": new_g.model_dump() if new_g else None,
                     },
                 )
+            tier_counts = {"added": 0, "updated": 0, "removed": 0}
+            for action, scope_key, old_t, new_t in tier_changes:
+                tier_counts[action] += 1
+                tier = new_t or old_t
+                self._audit.record(
+                    "rate_limit_change",
+                    {
+                        "action": action,
+                        "tier_id": tier.id if tier else None,
+                        "scope_key": "|".join(scope_key),
+                        "config_version": bundle.version,
+                        "source": source,
+                        "old": old_t.model_dump() if old_t else None,
+                        "new": new_t.model_dump() if new_t else None,
+                    },
+                )
             self._audit.record(
                 "config_applied",
                 {
@@ -276,17 +376,22 @@ class ConfigManager:
                     "release_groups_added": group_counts["added"],
                     "release_groups_updated": group_counts["updated"],
                     "release_groups_removed": group_counts["removed"],
+                    "rate_limit_tiers_added": tier_counts["added"],
+                    "rate_limit_tiers_updated": tier_counts["updated"],
+                    "rate_limit_tiers_removed": tier_counts["removed"],
                 },
             )
 
         snap = self.snapshot()
         invalidated = 0
-        for listener in self._listeners:
-            invalidated += listener(snap) or 0
+        if notify:
+            for listener in self._listeners:
+                invalidated += listener(snap) or 0
 
         return {
             "version": bundle.version,
             "changes": len(changes),
             "release_group_changes": len(group_changes),
+            "rate_limit_changes": len(tier_changes),
             "invalidated": invalidated,
         }

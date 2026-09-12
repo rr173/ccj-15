@@ -13,7 +13,14 @@ Resolution pipeline for (name, region, tenant, client_key, labels):
    match labels and the percent, so all of them participate in the
    deterministic choice; a client keeps its group while nothing changes
    and is reshuffled the moment the config version or the group moves.
-3. Look up the cache by the exact (name, region, tenant, client, labels)
+3. Consume one token from the tenant/label-aware rate-limit tier selected
+   before resolution. A request sees only the highest-priority matching
+   tier in the most specific visible layer (tenant, then region, then
+   global), and buckets are isolated by (tier, client key, tenant, label
+   signature). This happens before the cache read, so cache hits consume
+   quota; a rejected request neither reads a cached answer through the
+   resolver pipeline nor writes a new cache entry.
+4. Look up the cache by the exact (name, region, tenant, client, labels)
    key -- the ranking depends on the client key and the group decision
    on the labels, so answers are cached per client per label set and
    never shared across either. An entry is served only if it is
@@ -21,7 +28,7 @@ Resolution pipeline for (name, region, tenant, client_key, labels):
    AND the same gray decision (token) AND the health signature of the
    producing targets is unchanged. Otherwise it is evicted and the
    invalidation is audited.
-4. On a miss, compute the answer: deterministic weighted ranking of the
+5. On a miss, compute the answer: deterministic weighted ranking of the
    producing targets (group targets on a hit, base rule targets
    otherwise), first healthy target wins; if none is healthy the answer
    is degraded but still deterministic. Positive answers cache for the
@@ -51,6 +58,7 @@ from .models import (
     labels_signature,
     normalize_labels,
 )
+from .rate_limit import RateLimitDecision, RateLimitExceeded, RateLimiter
 from .selection import gray_bucket, rank_targets
 
 
@@ -78,12 +86,14 @@ class Resolver:
         cache: ResolutionCache,
         health: HealthRegistry,
         audit: AuditLog,
+        rate_limiter: Optional[RateLimiter] = None,
         clock: Callable[[], float] = time.time,
     ):
         self._config = config
         self._cache = cache
         self._health = health
         self._audit = audit
+        self._rate_limiter = rate_limiter
         self._clock = clock
         config.add_listener(self._on_config_applied)
 
@@ -171,6 +181,27 @@ class Resolver:
         # gets its own deterministic order and its own cache entries.
         key = client_key or f"{name}|{region}|{tenant}"
         snap = self._config.snapshot()
+        # Rate limiting happens before rule evaluation and before the cache
+        # read, so cache hits still consume quota and a denied request can
+        # neither serve from nor write a resolution cache entry.
+        rate_decision: Optional[RateLimitDecision] = None
+        if self._rate_limiter is not None:
+            rate_decision = self._rate_limiter.consume(
+                snap, name, region, tenant, key, labels, now
+            )
+            if not rate_decision.allowed:
+                raise RateLimitExceeded(rate_decision)
+            current = self._config.snapshot()
+            if current.version != snap.version:
+                # A config swap reset buckets during this request; retry once
+                # on the new policy rather than using a stale snapshot's tier.
+                snap = current
+                rate_decision = self._rate_limiter.consume(
+                    snap, name, region, tenant, key, labels, now
+                )
+                if not rate_decision.allowed:
+                    raise RateLimitExceeded(rate_decision)
+
         rule = snap.effective_rule(name, region, tenant, now)
         decision = self._evaluate_gray(snap, name, region, tenant, labels, key, now)
         fingerprint = rule.fingerprint() if rule else None
@@ -187,7 +218,7 @@ class Resolver:
                 entry, fingerprint, health_sig, decision.token
             )
             if stale_reason is None:
-                return self._answer(entry, snap, now, cached=True)
+                return self._answer(entry, snap, now, True, rate_decision)
             self._cache.evict(entry.key())
             self._audit.record(
                 "cache_invalidation",
@@ -210,7 +241,7 @@ class Resolver:
             snap, rule, decision, name, region, tenant, key, sig, labels, now
         )
         self._cache.put(entry)
-        return self._answer(entry, snap, now, cached=False)
+        return self._answer(entry, snap, now, False, rate_decision)
 
     def _compute(
         self,
@@ -416,9 +447,14 @@ class Resolver:
     # -- answers ----------------------------------------------------------
 
     def _answer(
-        self, entry: CacheEntry, snap: Snapshot, now: float, cached: bool
+        self,
+        entry: CacheEntry,
+        snap: Snapshot,
+        now: float,
+        cached: bool,
+        rate_decision: Optional[RateLimitDecision] = None,
     ) -> dict:
-        return {
+        answer = {
             "name": entry.name,
             "region": entry.region,
             "tenant": entry.tenant,
@@ -434,6 +470,10 @@ class Resolver:
             "ttl": max(0, int(entry.expires_at - now)),
             "expires_at": entry.expires_at,
         }
+        answer["rate_limit"] = (
+            rate_decision.public() if rate_decision is not None else None
+        )
+        return answer
 
     # -- introspection ----------------------------------------------------
 
@@ -452,6 +492,13 @@ class Resolver:
         sig = labels_signature(labels)
         key = client_key or f"{name}|{region}|{tenant}"
         snap = self._config.snapshot()
+        rate_decision = (
+            self._rate_limiter.inspect(
+                snap, region, tenant, key, labels, now
+            )
+            if self._rate_limiter is not None
+            else None
+        )
         rule = snap.effective_rule(name, region, tenant, now)
         decision = self._evaluate_gray(snap, name, region, tenant, labels, key, now)
         fingerprint = rule.fingerprint() if rule else None
@@ -539,12 +586,15 @@ class Resolver:
                 ],
             }
 
+        rate_limit_info = rate_decision.public() if rate_decision else None
+
         return {
             "name": name,
             "region": region,
             "tenant": tenant,
             "now": now,
             "config_version": snap.version,
+            "rate_limit": rate_limit_info,
             "effective_rule": rule_info,
             "selection": selection,
             "release": {

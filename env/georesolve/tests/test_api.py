@@ -193,6 +193,106 @@ def test_release_groups_end_to_end(client):
     assert r.json()["records"][0]["details"]["group_id"] == "g1"
 
 
+LIMIT_CONFIG = {
+    "version": 1,
+    "rules": [
+        {"name": "api", "scope": "global", "rule_version": 1, "ttl": 60,
+         "targets": [{"id": "b1", "address": "tcp://10.0.0.1:80", "weight": 1}]},
+    ],
+    "rate_limit_tiers": [
+        {"id": "tight", "scope": "global", "rate_per_second": 1, "burst": 1,
+         "priority": 10},
+        {"id": "canary", "scope": "global", "rate_per_second": 1, "burst": 1,
+         "priority": 1, "match_labels": {"env": "canary"}},
+    ],
+}
+
+
+def test_rate_limited_cache_hit_returns_429_without_cache_write(client):
+    assert client.post("/v1/config", json=LIMIT_CONFIG, headers=HEADERS).status_code == 200
+    params = {"name": "api", "client": "rate-client"}
+
+    first = client.get("/v1/resolve", params=params)
+    assert first.status_code == 200 and first.json()["rate_limit"]["tier_id"] == "tight"
+    second = client.get("/v1/resolve", params=params)
+    assert second.status_code == 200 and second.json()["cached"] is True
+    denied = client.get("/v1/resolve", params=params)
+    assert denied.status_code == 429
+    assert denied.headers["retry-after"] == "1"
+    body = denied.json()
+    assert body["detail"] == "rate_limit_exceeded"
+    assert body["rate_limit"]["tier_id"] == "tight"
+    assert body["rate_limit"]["remaining"] == 0
+    assert body["retry_after"] > 0
+
+    cache = client.get("/v1/cache", headers=HEADERS).json()["entries"]
+    rate_entries = [e for e in cache if e["client_key"] == "rate-client"]
+    assert len(rate_entries) == 1 and rate_entries[0]["kind"] == "positive"
+    audit = client.get("/v1/audit", params={"type": "rate_limit_rejected"},
+                       headers=HEADERS).json()["records"]
+    assert audit[0]["details"]["tier_id"] == "tight"
+
+
+def test_explain_reports_rate_limit_but_does_not_consume(client):
+    client.post("/v1/config", json=LIMIT_CONFIG, headers=HEADERS)
+    params = {"name": "api", "client": "explain-client", "labels": "env=canary"}
+
+    for _ in range(2):
+        info = client.get("/v1/explain", params=params).json()
+        rate = info["rate_limit"]
+        assert rate["tier_id"] == "canary"
+        assert rate["remaining"] == 1
+        assert rate["reason"] == "allowed"
+
+    resolved = client.get("/v1/resolve", params=params)
+    assert resolved.status_code == 200
+    denied = client.get("/v1/explain", params=params).json()
+    assert denied["rate_limit"]["reason"] == "rate_limit_exceeded"
+    assert denied["rate_limit"]["retry_after"] > 0
+
+
+@pytest.mark.parametrize(
+    "tier,message",
+    [
+        ({"id": "bad", "rate_per_second": -1, "burst": 1}, "positive"),
+        ({"id": "bad", "rate_per_second": 0, "burst": 1}, "positive"),
+        ({"id": "bad", "rate_per_second": 10, "burst": 4}, "burst"),
+    ],
+)
+def test_invalid_rate_limit_config_rejected(client, tier, message):
+    bad = {"version": 1, "rate_limit_tiers": [tier]}
+    r = client.post("/v1/config", json=bad, headers=HEADERS)
+    assert r.status_code == 422
+    assert message in str(r.json()["detail"])
+
+
+def test_duplicate_rate_limit_priority_labels_rejected(client):
+    bad = {"version": 1, "rate_limit_tiers": [
+        {"id": "a", "rate_per_second": 1, "burst": 1, "priority": 1,
+         "match_labels": {"env": "canary"}},
+        {"id": "b", "rate_per_second": 1, "burst": 1, "priority": 1,
+         "match_labels": {"env": "canary", "team": "pay"}},
+    ]}
+    r = client.post("/v1/config", json=bad, headers=HEADERS)
+    assert r.status_code == 422
+    assert "duplicate or otherwise compatible label conditions" in str(r.json()["detail"])
+
+
+def test_rate_limit_policy_change_audited_and_buckets_reset(client):
+    client.post("/v1/config", json=LIMIT_CONFIG, headers=HEADERS)
+    client.get("/v1/resolve", params={"name": "api", "client": "reset"})
+
+    v2 = dict(LIMIT_CONFIG, version=2)
+    r = client.post("/v1/config", json=v2, headers=HEADERS)
+    assert r.status_code == 200
+    # The version bump alone reset the exhausted bucket.
+    assert client.get("/v1/resolve", params={"name": "api", "client": "reset"}).status_code == 200
+
+    records = client.get("/v1/audit", params={"type": "rate_limit_bucket_reset"},
+                         headers=HEADERS).json()["records"]
+    assert records[0]["details"]["config_version"] == 2
+
+
 def test_malformed_labels_rejected(client):
     client.post("/v1/config", json=GRAY_CONFIG, headers=HEADERS)
     r = client.get("/v1/resolve", params={"name": "api", "labels": "envcanary"})

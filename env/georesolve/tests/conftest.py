@@ -10,6 +10,7 @@ from app.cache import ResolutionCache
 from app.config_store import ConfigManager
 from app.health import HealthRegistry
 from app.models import ConfigBundle, Defaults, Rule, Target
+from app.rate_limit import RateLimiter
 from app.resolver import Resolver
 from app.storage import connect
 
@@ -58,24 +59,29 @@ def bundle(
     rules: list[Rule],
     negative_ttl: int = 30,
     release_groups: list | None = None,
+    rate_limit_tiers: list | None = None,
 ) -> ConfigBundle:
     return ConfigBundle(
         version=version,
         defaults=Defaults(negative_ttl=negative_ttl),
         rules=rules,
         release_groups=release_groups or [],
+        rate_limit_tiers=rate_limit_tiers or [],
     )
 
 
 def make_stack(db_path: str, clock: FakeClock) -> SimpleNamespace:
-    audit = AuditLog(connect(db_path), clock)
-    config = ConfigManager(connect(db_path), audit, clock)
+    db = connect(db_path)
+    audit = AuditLog(db)
+    config = ConfigManager(db, audit, clock)
     cache = ResolutionCache(clock)
     health = HealthRegistry(clock)
-    resolver = Resolver(config, cache, health, audit, clock)
+    rate_limiter = RateLimiter(audit, clock)
+    config.add_listener(rate_limiter.replace_buckets)
+    resolver = Resolver(config, cache, health, audit, rate_limiter, clock)
     return SimpleNamespace(
         clock=clock, audit=audit, config=config, cache=cache,
-        health=health, resolver=resolver,
+        health=health, rate_limiter=rate_limiter, resolver=resolver,
     )
 
 

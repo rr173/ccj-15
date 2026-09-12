@@ -56,6 +56,81 @@ class Defaults(BaseModel):
     negative_ttl: int = Field(default=30, ge=0)
 
 
+class RateLimitTier(BaseModel):
+    """One resolution rate-limit tier at a configuration scope layer."""
+
+    id: str
+    scope: ScopeType = "global"
+    region: Optional[str] = None
+    tenant: Optional[str] = None
+    rate_per_second: float = Field(gt=0)
+    burst: float = Field(gt=0)
+    priority: int = Field(ge=0)  # smaller wins among matching tiers in the layer
+    match_labels: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("id")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("must be a non-empty string")
+        return v
+
+    @field_validator("rate_per_second", "burst")
+    @classmethod
+    def _finite_positive(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("rate and burst must be finite positive numbers")
+        return v
+
+    @field_validator("match_labels")
+    @classmethod
+    def _norm_match_labels(cls, v: dict[str, str]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for k, val in v.items():
+            key, value = str(k).strip().lower(), str(val).strip().lower()
+            if not key or not value:
+                raise ValueError("match label keys and values must be non-empty")
+            out[key] = value
+        return out
+
+    @model_validator(mode="after")
+    def _check_tier(self) -> "RateLimitTier":
+        region = self.region.strip().lower() if self.region is not None else None
+        tenant = self.tenant.strip().lower() if self.tenant is not None else None
+        self.region = region
+        self.tenant = tenant
+        if self.scope == "global" and (region or tenant):
+            raise ValueError("global rate-limit tier must not set region/tenant")
+        if self.scope == "region" and (not region or tenant):
+            raise ValueError(
+                "region rate-limit tier requires 'region' and must not set 'tenant'"
+            )
+        if self.scope == "tenant" and (not tenant or region):
+            raise ValueError(
+                "tenant rate-limit tier requires 'tenant' and must not set 'region'"
+            )
+        if self.burst < self.rate_per_second:
+            raise ValueError("rate-limit burst must be greater than or equal to rate")
+        return self
+
+    def scope_key(self) -> tuple:
+        return (self.scope, self.region or "", self.tenant or "")
+
+    def fingerprint(self) -> str:
+        """Content hash; any semantic change to the tier changes this."""
+        return hashlib.blake2b(self.model_dump_json().encode(), digest_size=8).hexdigest()
+
+    def visible_to(self, region: str, tenant: str) -> bool:
+        if self.scope == "global":
+            return True
+        if self.scope == "region":
+            return self.region == region
+        return self.tenant == tenant
+
+    def labels_match(self, labels: Mapping[str, str]) -> bool:
+        return all(labels.get(k) == v for k, v in self.match_labels.items())
+
+
 def normalize_labels(labels: Optional[Mapping[str, str]]) -> dict[str, str]:
     """Canonical request labels: stripped, lowercased, empties dropped."""
     out: dict[str, str] = {}
@@ -169,6 +244,7 @@ class ConfigBundle(BaseModel):
     defaults: Defaults = Field(default_factory=Defaults)
     rules: list[Rule] = Field(default_factory=list)
     release_groups: list[ReleaseGroup] = Field(default_factory=list)
+    rate_limit_tiers: list[RateLimitTier] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_bundle(self) -> "ConfigBundle":
@@ -183,7 +259,30 @@ class ConfigBundle(BaseModel):
                     f"rule {k} has rule_version {r.rule_version} > bundle version {self.version}"
                 )
         self._check_release_groups()
+        self._check_rate_limit_tiers()
         return self
+
+    def _check_rate_limit_tiers(self) -> None:
+        seen_ids: set[str] = set()
+        by_scope: dict[tuple, list[RateLimitTier]] = {}
+        for tier in self.rate_limit_tiers:
+            if tier.id in seen_ids:
+                raise ValueError(f"duplicate rate-limit tier id {tier.id!r}")
+            seen_ids.add(tier.id)
+            by_scope.setdefault(tier.scope_key(), []).append(tier)
+
+        for scope_key, tiers in by_scope.items():
+            for i, a in enumerate(tiers):
+                for b in tiers[i + 1:]:
+                    if (
+                        a.priority == b.priority
+                        and labels_compatible(a.match_labels, b.match_labels)
+                    ):
+                        raise ValueError(
+                            f"rate-limit tiers {a.id!r} and {b.id!r} at layer "
+                            f"{scope_key} have the same priority {a.priority} with "
+                            "duplicate or otherwise compatible label conditions"
+                        )
 
     def _check_release_groups(self) -> None:
         by_name: dict[str, list[ReleaseGroup]] = {}

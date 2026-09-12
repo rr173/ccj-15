@@ -3,15 +3,18 @@
 Data plane (unauthenticated, like a DNS resolver):
   GET /v1/resolve   - resolve a name for a region/tenant; optional
                       `labels=k=v,k2=v2` carries client labels used by
-                      gray release groups
+                      gray release groups and rate-limit matching;
+                      rejected over-quota requests return HTTP 429
   GET /v1/explain   - show the rule version, targets, effective time and
                       the release-group decision for a name/region/tenant
   GET /healthz      - liveness
 
 Control plane (requires Bearer token when GEORESOLVE_ADMIN_TOKEN is set):
-  GET  /v1/config          - current config snapshot (rules + release groups)
+  GET  /v1/config          - current config snapshot (rules, release groups
+                            and rate-limit tiers)
   POST /v1/config          - apply a new config bundle (monotonic version)
-  GET  /v1/audit           - rule/group changes, group hits, cache invalidations
+  GET  /v1/audit           - rule/group/rate-limit changes, group hits,
+                            bucket resets, rejects and cache invalidations
   GET  /v1/health/targets  - current target health view
   GET  /v1/cache           - cache contents (debug)
   POST /v1/cache/flush     - drop all cached answers (audited)
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 from . import __version__
 from .audit import AuditLog
@@ -34,6 +39,7 @@ from .cache import ResolutionCache
 from .config_store import ConfigManager, VersionConflict
 from .health import HealthChecker, HealthRegistry
 from .models import ConfigBundle
+from .rate_limit import RateLimitExceeded, RateLimiter
 from .resolver import Resolver
 from .storage import connect
 
@@ -59,11 +65,20 @@ class Components:
         self.health_timeout = health_timeout
         self.enable_background = enable_background
 
-        self.audit = AuditLog(connect(db_path))
-        self.config = ConfigManager(connect(db_path), self.audit)
+        db = connect(db_path)
+        self.audit = AuditLog(db)
+        self.config = ConfigManager(db, self.audit)
         self.cache = ResolutionCache(time.time)
         self.health = HealthRegistry()
-        self.resolver = Resolver(self.config, self.cache, self.health, self.audit)
+        self.rate_limiter = RateLimiter(self.audit, time.time)
+        self.config.add_listener(self.rate_limiter.replace_buckets)
+        self.resolver = Resolver(
+            self.config,
+            self.cache,
+            self.health,
+            self.audit,
+            self.rate_limiter,
+        )
         self.checker = HealthChecker(
             self.health,
             self.config,
@@ -152,6 +167,22 @@ def create_app(components: Components) -> FastAPI:
             labels[k] = v
         return labels
 
+    def rate_limited(exc: RateLimitExceeded) -> JSONResponse:
+        d = exc.decision
+        return JSONResponse(
+            status_code=429,
+            headers={
+                "Retry-After": str(
+                    max(1, math.ceil(d.retry_after if d.retry_after is not None else 1.0))
+                )
+            },
+            content={
+                "detail": d.reason,
+                "retry_after": d.retry_after,
+                "rate_limit": d.public(),
+            },
+        )
+
     # -- data plane ------------------------------------------------------
 
     @app.get("/healthz")
@@ -168,9 +199,12 @@ def create_app(components: Components) -> FastAPI:
         labels: str = "",
     ):
         client_key = client or (request.client.host if request.client else "")
-        return comp.resolver.resolve(
-            name, region, tenant, client_key, labels=parse_labels(labels)
-        )
+        try:
+            return comp.resolver.resolve(
+                name, region, tenant, client_key, labels=parse_labels(labels)
+            )
+        except RateLimitExceeded as exc:
+            return rate_limited(exc)
 
     @app.get("/v1/explain")
     async def explain(
@@ -202,6 +236,13 @@ def create_app(components: Components) -> FastAPI:
                 g.model_dump()
                 for g in sorted(
                     snap.all_release_groups(), key=lambda g: (g.name, g.priority, g.id)
+                )
+            ],
+            "rate_limit_tiers": [
+                t.model_dump()
+                for t in sorted(
+                    snap.all_rate_limit_tiers(),
+                    key=lambda t: (t.scope_key(), t.priority, t.id),
                 )
             ],
         }
