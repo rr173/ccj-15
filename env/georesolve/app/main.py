@@ -205,6 +205,7 @@ def create_app(components: Components) -> FastAPI:
                     "name": e.name,
                     "region": e.region,
                     "tenant": e.tenant,
+                    "client_key": e.client_key,
                     "kind": e.kind,
                     "rule_version": e.rule_version,
                     "expires_at": e.expires_at,

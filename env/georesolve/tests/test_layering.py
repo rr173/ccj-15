@@ -53,8 +53,8 @@ def test_no_cross_tenant_answer_leak(stack):
     assert ans["chosen"] != "v1"
     assert ans["chosen"] == "e1"
     # And a tenant with no rule at all falls to region/global, never to vip's.
-    entry_vip = stack.cache.peek("api", "eu", "vip")
-    entry_acme = stack.cache.peek("api", "eu", "acme")
+    entry_vip = stack.cache.peek("api", "eu", "vip", "c1")
+    entry_acme = stack.cache.peek("api", "eu", "acme", "c1")
     assert entry_vip is not None and entry_acme is not None
     assert entry_vip is not entry_acme
 

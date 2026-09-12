@@ -1,11 +1,13 @@
 """TTL cache for resolution answers.
 
-Cache keys are (name, region, tenant) triples, so an answer computed for
-one region or tenant is physically a different entry and can never be
-served to another. Each entry records the fingerprint of the rule that
-produced it and a signature of target health at store time; the resolver
-treats an entry as stale the moment the effective rule or the health view
-moves on, regardless of remaining TTL.
+Cache keys are (name, region, tenant, client_key) quadruples. The
+deterministic weighted ranking of a rule's targets is a function of the
+client key, so an answer computed for one client is physically a
+different entry and can never be served to another client, region, or
+tenant. Each entry records the fingerprint of the rule that produced it
+and a signature of target health at store time; the resolver treats an
+entry as stale the moment the effective rule or the health view moves
+on, regardless of remaining TTL.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ class CacheEntry:
     name: str
     region: str
     tenant: str
+    client_key: str  # effective selection key the answer was computed for
     kind: str  # "positive" | "negative"
     rule_version: Optional[int]  # None when no rule produced this answer
     rule_scope: Optional[str]
@@ -30,7 +33,7 @@ class CacheEntry:
     config_version: int
 
     def key(self) -> tuple:
-        return (self.name, self.region, self.tenant)
+        return (self.name, self.region, self.tenant, self.client_key)
 
 
 class ResolutionCache:
@@ -39,8 +42,10 @@ class ResolutionCache:
         self._lock = threading.Lock()
         self._entries: dict[tuple, CacheEntry] = {}
 
-    def get(self, name: str, region: str, tenant: str) -> Optional[CacheEntry]:
-        key = (name, region, tenant)
+    def get(
+        self, name: str, region: str, tenant: str, client_key: str = ""
+    ) -> Optional[CacheEntry]:
+        key = (name, region, tenant, client_key)
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
@@ -50,10 +55,12 @@ class ResolutionCache:
                 return None
             return entry
 
-    def peek(self, name: str, region: str, tenant: str) -> Optional[CacheEntry]:
+    def peek(
+        self, name: str, region: str, tenant: str, client_key: str = ""
+    ) -> Optional[CacheEntry]:
         """Return the entry without expiry eviction (for diagnostics)."""
         with self._lock:
-            return self._entries.get((name, region, tenant))
+            return self._entries.get((name, region, tenant, client_key))
 
     def put(self, entry: CacheEntry) -> None:
         if entry.expires_at <= entry.stored_at:

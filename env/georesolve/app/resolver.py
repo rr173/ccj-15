@@ -4,10 +4,12 @@ Resolution pipeline for (name, region, tenant, client_key):
 
 1. Take the current config snapshot and find the effective rule
    (tenant > region > global, only rules past their effective_from).
-2. Look up the cache by the exact (name, region, tenant) key. An entry is
-   served only if it is unexpired AND was produced by the same rule
-   content (fingerprint) AND the health signature of the rule's targets
-   is unchanged. Otherwise it is evicted and the invalidation is audited.
+2. Look up the cache by the exact (name, region, tenant, client) key --
+   the ranking depends on the client key, so answers are cached per
+   client and never shared across clients. An entry is served only if
+   it is unexpired AND was produced by the same rule content
+   (fingerprint) AND the health signature of the rule's targets is
+   unchanged. Otherwise it is evicted and the invalidation is audited.
 3. On a miss, compute the answer: deterministic weighted ranking of
    targets, first healthy target wins (deterministic failover order);
    if none is healthy the answer is degraded but still deterministic.
@@ -66,12 +68,15 @@ class Resolver:
     ) -> dict:
         now = self._clock() if now is None else now
         name, region, tenant = _norm(name), _norm(region), _norm(tenant)
+        # The selection key scopes both ranking and caching: each client
+        # gets its own deterministic order and its own cache entries.
+        key = client_key or f"{name}|{region}|{tenant}"
         snap = self._config.snapshot()
         rule = snap.effective_rule(name, region, tenant, now)
         fingerprint = rule.fingerprint() if rule else None
         health_sig = self._health_signature(rule)
 
-        entry = self._cache.get(name, region, tenant)
+        entry = self._cache.get(name, region, tenant, key)
         if entry is not None:
             stale_reason = self._staleness(entry, fingerprint, health_sig)
             if stale_reason is None:
@@ -90,7 +95,7 @@ class Resolver:
                 },
             )
 
-        entry = self._compute(snap, rule, name, region, tenant, client_key, now)
+        entry = self._compute(snap, rule, name, region, tenant, key, now)
         self._cache.put(entry)
         return self._answer(entry, snap, now, cached=False)
 
@@ -101,7 +106,7 @@ class Resolver:
         name: str,
         region: str,
         tenant: str,
-        client_key: str,
+        key: str,
         now: float,
     ) -> CacheEntry:
         nxt = snap.next_transition(name, region, tenant, now)
@@ -118,6 +123,7 @@ class Resolver:
                 name=name,
                 region=region,
                 tenant=tenant,
+                client_key=key,
                 kind="negative",
                 rule_version=rule.rule_version if rule else None,
                 rule_scope=rule.scope if rule else None,
@@ -130,7 +136,6 @@ class Resolver:
                 config_version=snap.version,
             )
 
-        key = client_key or f"{name}|{region}|{tenant}"
         ranked = rank_targets(key, rule.targets)
         healthy_ids = {t.id for t in ranked if self._health.is_healthy(t.id)}
         chosen = next((t for t in ranked if t.id in healthy_ids), None)
@@ -156,6 +161,7 @@ class Resolver:
             name=name,
             region=region,
             tenant=tenant,
+            client_key=key,
             kind="positive",
             rule_version=rule.rule_version,
             rule_scope=rule.scope,
@@ -246,13 +252,14 @@ class Resolver:
     ) -> dict:
         now = self._clock() if now is None else now
         name, region, tenant = _norm(name), _norm(region), _norm(tenant)
+        key = client_key or f"{name}|{region}|{tenant}"
         snap = self._config.snapshot()
         rule = snap.effective_rule(name, region, tenant, now)
         fingerprint = rule.fingerprint() if rule else None
         health_sig = self._health_signature(rule)
 
         cache_state = "absent"
-        entry = self._cache.peek(name, region, tenant)
+        entry = self._cache.peek(name, region, tenant, key)
         if entry is not None:
             if entry.expires_at <= now:
                 cache_state = "expired"
@@ -263,7 +270,6 @@ class Resolver:
         rule_info = None
         selection = None
         if rule is not None:
-            key = client_key or f"{name}|{region}|{tenant}"
             ranked = rank_targets(key, rule.targets) if rule.targets else []
             chosen = next((t for t in ranked if self._health.is_healthy(t.id)), None)
             degraded = chosen is None and bool(ranked)
@@ -310,6 +316,7 @@ class Resolver:
                 if entry is None
                 else {
                     "kind": entry.kind,
+                    "client_key": entry.client_key,
                     "rule_version": entry.rule_version,
                     "stored_at": entry.stored_at,
                     "expires_at": entry.expires_at,

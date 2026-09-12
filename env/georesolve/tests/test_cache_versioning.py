@@ -4,7 +4,36 @@ from __future__ import annotations
 import pytest
 
 from app.config_store import VersionConflict
+from app.selection import rank_targets
 from tests.conftest import bundle, rule, target
+
+
+def test_cache_is_scoped_per_client(stack):
+    """Same (name, region, tenant), different clients: each client gets
+    its own deterministic ranking and its own cache entry."""
+    targets = [target("a"), target("b"), target("c")]
+    stack.config.apply(bundle(1, [rule("api", targets=targets, ttl=100)]))
+
+    first_c1 = stack.resolver.resolve("api", client_key="c1")
+    first_c3 = stack.resolver.resolve("api", client_key="c3")
+    assert first_c1["cached"] is False
+    assert first_c3["cached"] is False  # must not be served c1's entry
+
+    order_c1 = [t["id"] for t in first_c1["targets"]]
+    order_c3 = [t["id"] for t in first_c3["targets"]]
+    assert order_c1 == [t.id for t in rank_targets("c1", targets)]
+    assert order_c3 == [t.id for t in rank_targets("c3", targets)]
+    assert order_c1 != order_c3  # the rankings genuinely differ
+    assert first_c1["chosen"] == order_c1[0]
+    assert first_c3["chosen"] == order_c3[0]
+
+    # A repeat request from the same client still hits its own entry.
+    second_c1 = stack.resolver.resolve("api", client_key="c1")
+    second_c3 = stack.resolver.resolve("api", client_key="c3")
+    assert second_c1["cached"] is True
+    assert second_c3["cached"] is True
+    assert second_c1["chosen"] == first_c1["chosen"]
+    assert second_c3["chosen"] == first_c3["chosen"]
 
 
 def test_positive_answer_cached_until_ttl(stack):
