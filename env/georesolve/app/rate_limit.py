@@ -288,6 +288,23 @@ class RateLimiter:
         )
         return hashlib.blake2b(raw.encode(), digest_size=8).hexdigest()
 
+    def preview_replace(
+        self, old_snap: Snapshot, new_snap: Snapshot
+    ) -> dict:
+        """Dry-run counterpart of ``replace_buckets`` for config previews.
+
+        Projects bucket/policy changes without clearing buckets or writing
+        an audit record.
+        """
+        with self._lock:
+            live_buckets = len(self._buckets)
+            old_fingerprint = self._policy_fingerprint
+        new_fingerprint = self._compute_policy_fingerprint(new_snap)
+        return {
+            "rate_limit_buckets_reset": live_buckets,
+            "rate_limit_policy_changed": int(new_fingerprint != old_fingerprint),
+        }
+
     def replace_buckets(self, snap: Snapshot) -> int:
         """Replace buckets immediately after a new config version is applied."""
         fingerprint = self._compute_policy_fingerprint(snap)

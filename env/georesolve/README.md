@@ -76,6 +76,59 @@
   （命中，含分桶、百分比、窗口、标签）、缓存失效记录携带 `group_id`，
   灰度决策变化导致的失效原因为 `release_group_changed`。
 
+## 配置变更管理：预演、历史与回滚
+
+### 预演（dry-run）
+- `POST /v1/config/preview`（回滚对应 `POST /v1/config/rollback/preview`）按与正式应用
+  **完全相同**的流程计算：bundle 校验、未来定时规则合并、规则/发布组/限流档位差异、
+  灰度选择影响、将被失效的缓存条目（按规则指纹与灰度令牌逐条判定）、限流策略指纹变化与
+  将重置的桶数量。
+- 预演**不写任何正式状态**：生效配置、解析缓存、限流桶、SQLite 版本表和审计日志都保持
+  不变。预演令牌仅保存在内存中，默认 300 秒过期（`GEORESOLVE_PREVIEW_TTL`）。
+- 响应包含：`base_version`、`proposed_version`、内容指纹、差异计数、影响（`impact`）、
+  完整版本摘要（`summary`：受影响名字、每条规则/发布组/限流档位的新旧值）和一次性
+  `preview_token`。请求体省略 `version` 时默认取“当前版本 + 1”。
+- `POST /v1/config` / `POST /v1/config/rollback` 可携带 `preview_token`；服务端校验：
+  - 令牌过期 → **410 Gone**（预演结果过期，请重新预演）；
+  - 令牌已被使用或未知 → **409**；
+  - 预演基线版本与当前版本不一致（期间有别的提交）→ **409**（预演已过时）；
+  - 提交内容指纹/目标版本/预演种类（apply vs rollback）不匹配 → **409**。
+- 不带 `preview_token` 的提交行为与以前一致（仍然做全部校验和版本单调性检查）。
+
+### 版本历史
+- 每次正式应用都会在 `config_versions` 中持久化版本载荷与可查询摘要。摘要至少包含：
+  - `affected_names`：受影响的名字（规则增删改、发布组增删改涉及的名字并集）；
+  - `rule_diffs`：每条规则的动作（added/updated/removed）、作用域、新旧 `rule_version`
+    与目标 ID；
+  - `release_group_diffs`：发布组的动作、优先级、百分比、标签、目标集合新旧值；
+  - `rate_limit_tier_diffs`：限流档位的动作、作用域、`rate_per_second`/`burst` 新旧值；
+  - `impact`：实际失效缓存条目数（规则变化/灰度变化分项）、限流桶重置数与策略是否变化；
+  - `base_version`、内容指纹与（回滚产生时）`rollback_of`。
+- `GET /v1/config/versions` 返回摘要列表（不含完整载荷），
+  `GET /v1/config/versions/{v}` 返回单个版本的摘要、差异与完整 bundle（`?payload=false`
+  可省略载荷）。升级前创建的数据库自动迁移出 `summary` 列，旧版本的差异为空。
+
+### 安全回滚
+- `POST /v1/config/rollback`（体 `{"version": N}`）取回已保存版本 N 的**全量**载荷，
+  将其头部版本重写为**全新的、严格更高的版本号**（默认当前 + 1，也可显式给
+  `new_version`，仍必须高于当前版本），然后复用普通应用的同一条提交管线：
+  Pydantic 校验 → 差异计算 → 持久化（版本表，带 `rollback_of=N` 摘要）→ 内存生效 →
+  缓存选择性失效 → 限流桶重置 → 审计（`rule_change`/`release_group_change`/
+  `rate_limit_change`/`config_applied` 外加一条 `config_rollback`）。
+- 明确拒绝：
+  - 版本 N 不存在 → **404**；
+  - N 就是当前版本 → **409**（回滚目标与当前版本相同）；
+  - N 的内容指纹与当前生效配置完全相同 → **409**（回滚不会带来任何变化）；
+  - `new_version <= 当前版本`、预演令牌过期/过时/不匹配 → 相应 4xx。
+- 回滚后历史中出现的是一个**新版本**（可继续回滚、可再次回滚到任意历史版本）；
+  因为内容指纹相同而无变化的重复回滚会被拒绝。
+
+### 并发提交
+- 进程内由配置管理器的锁串行化；跨节点/进程由 SQLite 版本主键兜底：相同版本号的第二个
+  提交者得到 **409**，且因为先持久化后生效，失败方的内存配置与缓存不会被半应用状态污染。
+- 客户端可带 `expected_version` 做乐观并发控制：仅当当前版本等于该值时才提交，否则
+  **409**，从而保证并发提交不会覆盖较新的版本。
+
 ## API
 
 数据面（无需认证）：
@@ -91,8 +144,13 @@
 | 接口 | 说明 |
 |---|---|
 | `GET /v1/config` | 当前配置快照（版本、默认值、全部规则含定时版本、全部发布组、全部限流档位） |
-| `POST /v1/config` | 应用新配置 bundle（版本必须递增） |
-| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied` |
+| `POST /v1/config` | 应用新配置 bundle（版本必须递增）；可带 `expected_version` 做乐观并发校验，可带 `preview_token` 只提交预演过的内容 |
+| `POST /v1/config/preview` | 配置预演：跑完整校验/合并/差异/影响计算（规则、灰度组、缓存失效、限流桶），**不改变生效配置、缓存、限流桶或审计**，返回一次性、有时效的 `preview_token` |
+| `GET /v1/config/versions?limit=` | 已保存版本列表与摘要（受影响名字、规则/发布组/限流档位差异、影响） |
+| `GET /v1/config/versions/{v}?payload=true` | 单个已保存版本：摘要、差异与完整 bundle |
+| `POST /v1/config/rollback` | 回滚到已保存版本：以其内容生成**更高的新版本**，走与普通应用相同的校验、缓存失效、桶重置与审计流程；可带 `expected_version`/`preview_token` |
+| `POST /v1/config/rollback/preview` | 回滚预演（不落任何变更） |
+| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback` |
 | `GET /v1/health/targets` | 目标健康视图 |
 | `GET /v1/cache` / `POST /v1/cache/flush` | 缓存查看 / 清空（清空会记审计） |
 
@@ -169,6 +227,7 @@ curl "http://localhost:8081/v1/resolve?name=api&region=eu&tenant=vip&client=1.2.
 | `GEORESOLVE_ADMIN_TOKEN` | 无 | 控制面 Bearer 令牌（不设置则不鉴权，勿暴露公网） |
 | `GEORESOLVE_HEALTH_INTERVAL` / `GEORESOLVE_HEALTH_TIMEOUT` | `2.0` / `1.0` | 健康检查间隔/超时（秒） |
 | `GEORESOLVE_BACKGROUND` | `1` | 置 `0` 关闭后台健康检查与文件监视 |
+| `GEORESOLVE_PREVIEW_TTL` | `300` | 预演令牌有效期（秒），过期后提交该预演结果会被拒绝（410） |
 
 ## 测试
 
@@ -177,12 +236,16 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-85 个用例覆盖：三层覆盖与跨租户/区域隔离、加权选择的确定性与分布、正/负缓存与
+107 个用例覆盖：三层覆盖与跨租户/区域隔离、加权选择的确定性与分布、正/负缓存与
 TTL、版本单调性与选择性失效、定时规则激活、健康切换的确定顺序与恢复收敛、
 健康检查阈值、灰度发布组（标签匹配、时间窗口、百分比确定性、优先级、缓存隔离
 与失效、explain 与审计、非法配置拒绝）、租户/标签限流（层级选择、优先级、
 client/tenant/标签桶隔离、缓存命中扣费、429/Retry-After、拒绝不写缓存、
-explain 余量、桶替换重置与审计、非法配置拒绝）、API 全流程（含 400/401/409/422/429）。
+explain 余量、桶替换重置与审计、非法配置拒绝）、配置变更管理（预演不改任何正式
+状态、预演影响与实际失效一致、预演令牌的过期/单次/过时基线/内容篡改/种类不匹配
+拒绝、版本历史与差异查询、回滚生成更高新版本并走完整校验/缓存/审计管线、回滚到
+不存在/当前/同内容版本被拒、乐观并发与同版本号并发提交不覆盖）、
+API 全流程（含 400/401/404/409/410/422/429）。
 
 ## 设计说明与边界
 

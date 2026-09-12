@@ -77,7 +77,9 @@ def make_stack(db_path: str, clock: FakeClock) -> SimpleNamespace:
     cache = ResolutionCache(clock)
     health = HealthRegistry(clock)
     rate_limiter = RateLimiter(audit, clock)
-    config.add_listener(rate_limiter.replace_buckets)
+    config.add_listener(
+        rate_limiter.replace_buckets, rate_limiter.preview_replace
+    )
     resolver = Resolver(config, cache, health, audit, rate_limiter, clock)
     return SimpleNamespace(
         clock=clock, audit=audit, config=config, cache=cache,

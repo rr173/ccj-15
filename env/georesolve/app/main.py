@@ -10,14 +10,27 @@ Data plane (unauthenticated, like a DNS resolver):
   GET /healthz      - liveness
 
 Control plane (requires Bearer token when GEORESOLVE_ADMIN_TOKEN is set):
-  GET  /v1/config          - current config snapshot (rules, release groups
-                            and rate-limit tiers)
-  POST /v1/config          - apply a new config bundle (monotonic version)
-  GET  /v1/audit           - rule/group/rate-limit changes, group hits,
-                            bucket resets, rejects and cache invalidations
-  GET  /v1/health/targets  - current target health view
-  GET  /v1/cache           - cache contents (debug)
-  POST /v1/cache/flush     - drop all cached answers (audited)
+  GET  /v1/config              - current config snapshot (rules, release groups
+                                 and rate-limit tiers)
+  POST /v1/config              - apply a new config bundle (monotonic version);
+                                 optional expected_version (optimistic
+                                 concurrency) and preview_token (commit a
+                                 dry-run result; expired/reused/stale tokens
+                                 are rejected)
+  POST /v1/config/preview      - dry-run a bundle: full validation and impact
+                                 (rules, gray groups, cache evictions, rate
+                                 limits); changes nothing
+  GET  /v1/config/versions     - saved version summaries and diffs
+  GET  /v1/config/versions/{v} - one saved version, summary/diff and payload
+  POST /v1/config/rollback     - restore a saved version as a brand-new,
+                                 strictly higher version through the normal
+                                 validation/cache/audit pipeline
+  POST /v1/config/rollback/preview - dry-run a rollback
+  GET  /v1/audit               - rule/group/rate-limit changes, group hits,
+                                 bucket resets, rejects and cache invalidations
+  GET  /v1/health/targets      - current target health view
+  GET  /v1/cache               - cache contents (debug)
+  POST /v1/cache/flush         - drop all cached answers (audited)
 """
 from __future__ import annotations
 
@@ -32,16 +45,51 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from . import __version__
 from .audit import AuditLog
 from .cache import ResolutionCache
-from .config_store import ConfigManager, VersionConflict
+from .config_store import (
+    ConfigManager,
+    PreviewRejected,
+    RollbackRejected,
+    VersionConflict,
+    VersionNotFound,
+)
 from .health import HealthChecker, HealthRegistry
 from .models import ConfigBundle
 from .rate_limit import RateLimitExceeded, RateLimiter
 from .resolver import Resolver
 from .storage import connect
+
+
+class ConfigApplyRequest(ConfigBundle):
+    expected_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="optimistic concurrency: commit only when the live "
+        "version equals this one",
+    )
+    preview_token: Optional[str] = Field(
+        default=None,
+        description="token returned by /v1/config/preview for this payload",
+    )
+
+
+class ConfigPreviewRequest(ConfigApplyRequest):
+    version: Optional[int] = Field(  # type: ignore[assignment]
+        default=None,
+        ge=1,
+        description="defaults to current version + 1",
+    )
+
+
+class RollbackRequest(BaseModel):
+    version: int = Field(ge=1, description="saved version to restore")
+    expected_version: Optional[int] = Field(default=None, ge=0)
+    preview_token: Optional[str] = None
+    new_version: Optional[int] = Field(default=None, ge=1)
 
 
 class Components:
@@ -54,6 +102,7 @@ class Components:
         health_interval: float = 2.0,
         health_timeout: float = 1.0,
         enable_background: bool = True,
+        preview_ttl: float = 300.0,
     ):
         self.db_path = db_path
         db_dir = os.path.dirname(os.path.abspath(db_path))
@@ -67,11 +116,14 @@ class Components:
 
         db = connect(db_path)
         self.audit = AuditLog(db)
-        self.config = ConfigManager(db, self.audit)
+        self.config = ConfigManager(db, self.audit, preview_ttl=preview_ttl)
         self.cache = ResolutionCache(time.time)
         self.health = HealthRegistry()
         self.rate_limiter = RateLimiter(self.audit, time.time)
-        self.config.add_listener(self.rate_limiter.replace_buckets)
+        self.config.add_listener(
+            self.rate_limiter.replace_buckets,
+            self.rate_limiter.preview_replace,
+        )
         self.resolver = Resolver(
             self.config,
             self.cache,
@@ -247,13 +299,124 @@ def create_app(components: Components) -> FastAPI:
             ],
         }
 
+    def render_preview(result) -> dict:
+        """Serialize a manager PreviewResult into the API response shape."""
+        plan = result.plan
+        return {
+            "dry_run": True,
+            "kind": result.kind,
+            "base_version": result.base_version,
+            "proposed_version": result.proposed_version,
+            "rollback_of": result.rollback_of,
+            "fingerprint": result.fingerprint,
+            "preview_token": result.token,
+            "expires_at": result.expires_at,
+            "ttl_seconds": max(0, int(result.expires_at - time.time())),
+            "counts": plan.counts(),
+            "impact": result.listener_impacts,
+            "summary": comp.config.preview_summary(result),
+        }
+
     @app.post("/v1/config", dependencies=[Depends(admin_guard)])
-    async def post_config(bundle: ConfigBundle):
+    async def post_config(req: ConfigApplyRequest):
+        expected = req.expected_version
+        token = req.preview_token
+        # ConfigApplyRequest is itself a ConfigBundle (version/defaults/...).
+        bundle = ConfigBundle(**req.model_dump(exclude={"expected_version", "preview_token"}))
         try:
-            result = comp.config.apply(bundle, source="api")
+            result = comp.config.apply(
+                bundle,
+                source="api",
+                expected_version=expected,
+                preview_token=token,
+            )
         except VersionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        return {"applied": True, **result}
+        except PreviewRejected as exc:
+            raise HTTPException(status_code=getattr(exc, "status_code", 409),
+                                detail=str(exc))
+        return {
+            "applied": True,
+            "version": result["version"],
+            "changes": result["changes"],
+            "release_group_changes": result["release_group_changes"],
+            "rate_limit_changes": result["rate_limit_changes"],
+            "invalidated": result["invalidated"],
+            "summary": result["summary"],
+        }
+
+    @app.post("/v1/config/preview", dependencies=[Depends(admin_guard)])
+    async def preview_config(req: ConfigPreviewRequest):
+        if req.version is None:
+            req = req.model_copy(update={"version": comp.config.snapshot().version + 1})
+        bundle = ConfigBundle(
+            **req.model_dump(exclude={"expected_version", "preview_token"})
+        )
+        try:
+            result = comp.config.preview_bundle(bundle)
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return render_preview(result)
+
+    @app.get("/v1/config/versions", dependencies=[Depends(admin_guard)])
+    async def list_versions(limit: int = Query(default=50, ge=1, le=500)):
+        return {"versions": comp.config.versions(limit=limit)}
+
+    @app.get(
+        "/v1/config/versions/{version}",
+        dependencies=[Depends(admin_guard)],
+    )
+    async def get_version(
+        version: int,
+        payload: bool = Query(default=True, description="include full bundle"),
+    ):
+        try:
+            return comp.config.version_info(version, include_payload=payload)
+        except VersionNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.post(
+        "/v1/config/rollback/preview",
+        dependencies=[Depends(admin_guard)],
+    )
+    async def preview_rollback(req: RollbackRequest):
+        try:
+            result = comp.config.preview_rollback(req.version)
+        except VersionNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except RollbackRejected as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return render_preview(result)
+
+    @app.post("/v1/config/rollback", dependencies=[Depends(admin_guard)])
+    async def post_rollback(req: RollbackRequest):
+        try:
+            result = comp.config.rollback(
+                req.version,
+                source="api_rollback",
+                expected_version=req.expected_version,
+                preview_token=req.preview_token,
+                new_version=req.new_version,
+            )
+        except VersionNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except RollbackRejected as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except PreviewRejected as exc:
+            raise HTTPException(status_code=getattr(exc, "status_code", 409),
+                                detail=str(exc))
+        return {
+            "rolled_back": True,
+            "target_version": req.version,
+            "version": result["version"],
+            "changes": result["changes"],
+            "release_group_changes": result["release_group_changes"],
+            "rate_limit_changes": result["rate_limit_changes"],
+            "invalidated": result["invalidated"],
+            "summary": result["summary"],
+        }
 
     @app.get("/v1/audit", dependencies=[Depends(admin_guard)])
     async def get_audit(
@@ -310,5 +473,6 @@ def build_from_env() -> FastAPI:
         health_interval=float(os.environ.get("GEORESOLVE_HEALTH_INTERVAL", "2.0")),
         health_timeout=float(os.environ.get("GEORESOLVE_HEALTH_TIMEOUT", "1.0")),
         enable_background=os.environ.get("GEORESOLVE_BACKGROUND", "1") != "0",
+        preview_ttl=float(os.environ.get("GEORESOLVE_PREVIEW_TTL", "300")),
     )
     return create_app(comp)

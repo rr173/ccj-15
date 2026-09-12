@@ -95,7 +95,7 @@ class Resolver:
         self._audit = audit
         self._rate_limiter = rate_limiter
         self._clock = clock
-        config.add_listener(self._on_config_applied)
+        config.add_listener(self._on_config_applied, self.preview_config_impact)
 
     # -- gray release groups --------------------------------------------
 
@@ -404,15 +404,18 @@ class Resolver:
             return "health_changed"
         return None
 
-    def _on_config_applied(self, snap: Snapshot) -> int:
-        """Eagerly evict entries whose effective rule or gray decision changed."""
+    def _invalidation_plan(self, new_snap: Snapshot) -> list[tuple]:
+        """Entries of the current cache that a move to ``new_snap`` would
+        invalidate, with the staleness reason. Pure: evicts nothing."""
         now = self._clock()
-        invalidated = 0
+        doomed = []
         for entry in self._cache.items():
-            rule = snap.effective_rule(entry.name, entry.region, entry.tenant, now)
+            rule = new_snap.effective_rule(
+                entry.name, entry.region, entry.tenant, now
+            )
             fingerprint = rule.fingerprint() if rule else None
             decision = self._evaluate_gray(
-                snap,
+                new_snap,
                 entry.name,
                 entry.region,
                 entry.tenant,
@@ -424,24 +427,58 @@ class Resolver:
                 fingerprint != entry.rule_fingerprint
                 or decision.token != entry.group_token
             ):
-                self._cache.evict(entry.key())
-                invalidated += 1
-                self._audit.record(
-                    "cache_invalidation",
-                    {
-                        "name": entry.name,
-                        "region": entry.region,
-                        "tenant": entry.tenant,
-                        "reason": "config_applied",
-                        "old_rule_version": entry.rule_version,
-                        "new_rule_version": rule.rule_version if rule else None,
-                        "group_id": entry.group_id,
-                        "new_group_id": decision.group.id
-                        if decision.hit and decision.group
-                        else None,
-                        "config_version": snap.version,
-                    },
-                )
+                if fingerprint != entry.rule_fingerprint:
+                    reason = "rule_version_changed"
+                else:
+                    reason = "release_group_changed"
+                doomed.append((entry, reason, rule, decision))
+        return doomed
+
+    def preview_config_impact(
+        self, old_snap: Snapshot, new_snap: Snapshot
+    ) -> dict:
+        """Dry-run projection for ConfigManager previews: computes how many
+        cached answers the candidate config would evict, without evicting
+        them, touching buckets or writing audit records."""
+        doomed = self._invalidation_plan(new_snap)
+        reasons: dict[str, int] = {}
+        affected_names: set[str] = set()
+        for entry, reason, _rule, _decision in doomed:
+            reasons[reason] = reasons.get(reason, 0) + 1
+            affected_names.add(entry.name)
+        return {
+            "cache_entries_invalidated": len(doomed),
+            "cache_invalidation_rule_changed": reasons.get(
+                "rule_version_changed", 0
+            ),
+            "cache_invalidation_group_changed": reasons.get(
+                "release_group_changed", 0
+            ),
+            "cache_invalidation_affected_names": len(affected_names),
+        }
+
+    def _on_config_applied(self, snap: Snapshot) -> int:
+        """Eagerly evict entries whose effective rule or gray decision changed."""
+        invalidated = 0
+        for entry, _reason, rule, decision in self._invalidation_plan(snap):
+            self._cache.evict(entry.key())
+            invalidated += 1
+            self._audit.record(
+                "cache_invalidation",
+                {
+                    "name": entry.name,
+                    "region": entry.region,
+                    "tenant": entry.tenant,
+                    "reason": "config_applied",
+                    "old_rule_version": entry.rule_version,
+                    "new_rule_version": rule.rule_version if rule else None,
+                    "group_id": entry.group_id,
+                    "new_group_id": decision.group.id
+                    if decision.hit and decision.group
+                    else None,
+                    "config_version": snap.version,
+                },
+            )
         return invalidated
 
     # -- answers ----------------------------------------------------------

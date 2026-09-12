@@ -9,12 +9,37 @@ activate at a planned moment.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from typing import Literal, Mapping, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 ScopeType = Literal["global", "region", "tenant"]
+
+
+def canonical_json(data: dict) -> str:
+    """Stable serialization of a model dict, independent of key order."""
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def bundle_fingerprint(bundle: "ConfigBundle") -> str:
+    """Content hash of a bundle's full desired state (version excluded).
+
+    Two bundles with identical defaults/rules/groups/tiers hash equally even
+    when their config versions differ; used to tell rollbacks that change
+    nothing from ones that do, and to bind a dry-run preview to the exact
+    payload that is later applied.
+    """
+    material = {
+        "defaults": bundle.defaults.model_dump(),
+        "rules": [r.model_dump() for r in bundle.rules],
+        "release_groups": [g.model_dump() for g in bundle.release_groups],
+        "rate_limit_tiers": [t.model_dump() for t in bundle.rate_limit_tiers],
+    }
+    return hashlib.blake2b(
+        canonical_json(material).encode(), digest_size=8
+    ).hexdigest()
 
 
 class Target(BaseModel):
@@ -254,7 +279,7 @@ class ConfigBundle(BaseModel):
             if k in seen:
                 raise ValueError(f"duplicate rule for {k}")
             seen.add(k)
-            if r.rule_version > self.version:
+            if self.version is not None and r.rule_version > self.version:
                 raise ValueError(
                     f"rule {k} has rule_version {r.rule_version} > bundle version {self.version}"
                 )
@@ -287,7 +312,7 @@ class ConfigBundle(BaseModel):
     def _check_release_groups(self) -> None:
         by_name: dict[str, list[ReleaseGroup]] = {}
         for g in self.release_groups:
-            if g.rule_version > self.version:
+            if self.version is not None and g.rule_version > self.version:
                 raise ValueError(
                     f"release group {g.id!r} has rule_version {g.rule_version} "
                     f"> bundle version {self.version}"

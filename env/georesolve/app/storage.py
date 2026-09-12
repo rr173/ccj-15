@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS config_versions (
     version    INTEGER PRIMARY KEY,
     applied_at REAL NOT NULL,
     source     TEXT NOT NULL,
-    payload    TEXT NOT NULL
+    payload    TEXT NOT NULL,
+    summary    TEXT
 );
 CREATE TABLE IF NOT EXISTS audit (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,4 +26,8 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    # Migration for databases created before version summaries existed.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(config_versions)")}
+    if "summary" not in cols:
+        conn.execute("ALTER TABLE config_versions ADD COLUMN summary TEXT")
     return conn
