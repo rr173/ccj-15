@@ -211,3 +211,14 @@ def test_invalid_release_group_config_rejected(client):
     ])
     r = client.post("/v1/config", json=overlapping, headers=HEADERS)
     assert r.status_code == 422
+
+    # Same name and scope layer, overlapping windows, but *different* match
+    # labels and priorities must still be rejected with a clear error.
+    diff_labels = dict(GRAY_CONFIG, release_groups=[
+        dict(GRAY_CONFIG["release_groups"][0], id="g1", priority=10),
+        dict(GRAY_CONFIG["release_groups"][0], id="g2", priority=20,
+             match_labels={"env": "prod"}),
+    ])
+    r = client.post("/v1/config", json=diff_labels, headers=HEADERS)
+    assert r.status_code == 422
+    assert "overlapping windows" in str(r.json()["detail"])

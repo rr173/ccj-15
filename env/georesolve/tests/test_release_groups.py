@@ -188,22 +188,25 @@ def test_window_end_reverts_to_base_rule(stack):
 
 
 def test_percent_zero_never_hits_and_percent_100_always_hits(stack):
+    # The two groups live in different scope layers: same-layer groups may
+    # never have overlapping windows, but a global and a region group can.
     stack.config.apply(
         bundle(
             1,
             [base_rule()],
             release_groups=[
                 rgroup("g0", match_labels={"env": "zero"}, percent=0),
-                rgroup("g100", match_labels={"env": "full"}, percent=100,
+                rgroup("g100", scope="region", region="eu",
+                       match_labels={"env": "full"}, percent=100,
                        targets=[target("c1")]),
             ],
         )
     )
     for i in range(20):
-        ans = stack.resolver.resolve("api", client_key=f"c{i}",
+        ans = stack.resolver.resolve("api", region="eu", client_key=f"c{i}",
                                      labels={"env": "zero"})
         assert ans["release_group"] is None and ans["chosen"] == "b1"
-        ans = stack.resolver.resolve("api", client_key=f"c{i}",
+        ans = stack.resolver.resolve("api", region="eu", client_key=f"c{i}",
                                      labels={"env": "full"})
         assert ans["release_group"] == "g100" and ans["chosen"] == "c1"
 
@@ -282,6 +285,8 @@ def test_highest_priority_group_wins_across_scopes(stack):
 
 
 def test_only_one_group_is_hit(stack):
+    # Different scope layers: both groups are visible to an eu request and
+    # match its labels, so priority must arbitrate between them.
     stack.config.apply(
         bundle(
             1,
@@ -289,14 +294,15 @@ def test_only_one_group_is_hit(stack):
             release_groups=[
                 rgroup("g-low", priority=20, match_labels={"tier": "internal"},
                        targets=[target("c1")]),
-                rgroup("g-high", priority=1, match_labels={"env": "canary"},
-                       targets=[target("c2")]),
+                rgroup("g-high", scope="region", region="eu", priority=1,
+                       match_labels={"env": "canary"}, targets=[target("c2")]),
             ],
         )
     )
     # A client matching both conditions hits exactly the higher-priority one.
     ans = stack.resolver.resolve(
-        "api", client_key="c", labels={"env": "canary", "tier": "internal"}
+        "api", region="eu", client_key="c",
+        labels={"env": "canary", "tier": "internal"}
     )
     assert ans["release_group"] == "g-high" and ans["chosen"] == "c2"
 
@@ -429,9 +435,12 @@ def test_explain_reasons_for_misses(stack):
             1,
             [base_rule()],
             release_groups=[
+                # Adjacent, non-overlapping windows keep both groups legal in
+                # the same layer while exercising both miss reasons.
+                rgroup("g-zero", match_labels={"env": "zero"}, percent=0,
+                       window_start=now - 200, window_end=now + 100),
                 rgroup("g-future", match_labels={"env": "canary"},
                        window_start=now + 100, window_end=now + 200),
-                rgroup("g-zero", match_labels={"env": "zero"}, percent=0),
             ],
         )
     )
@@ -536,6 +545,31 @@ def test_overlapping_windows_same_scope_rejected(stack):
     ]
     with pytest.raises(ValidationError, match="overlapping windows"):
         bundle(1, [base_rule()], release_groups=groups)
+
+
+def test_overlapping_windows_same_scope_different_labels_rejected(stack):
+    # The labels differ -- even contradict each other -- and the priorities
+    # differ as well, but two groups in the same name/scope layer must never
+    # have overlapping windows.
+    groups = [
+        rgroup("g1", priority=1, match_labels={"env": "canary"},
+               window_start=NOW, window_end=NOW + 100),
+        rgroup("g2", priority=2, match_labels={"env": "prod"},
+               window_start=NOW + 50, window_end=NOW + 150),
+    ]
+    with pytest.raises(ValidationError, match="overlapping windows"):
+        bundle(1, [base_rule()], release_groups=groups)
+
+
+def test_overlapping_windows_different_scopes_allowed(stack):
+    # Different scope layers can overlap; priority arbitrates visibility.
+    groups = [
+        rgroup("g1", priority=10, window_start=NOW, window_end=NOW + 100),
+        rgroup("g2", scope="region", region="eu", priority=5,
+               window_start=NOW + 50, window_end=NOW + 150),
+    ]
+    stack.config.apply(bundle(1, [base_rule()], release_groups=groups))
+    assert len(stack.config.snapshot().groups_for_name("api")) == 2
 
 
 def test_adjacent_windows_allowed(stack):

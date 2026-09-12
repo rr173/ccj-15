@@ -200,23 +200,24 @@ class ConfigBundle(BaseModel):
                 raise ValueError(f"duplicate release group id for name {name!r}")
             # Overlapping windows are rejected exactly when they would make
             # the choice ambiguous or contradictory:
-            # 1. same scope layer + identical label conditions + overlap:
-            #    the groups compete for the same clients in the same layer,
-            #    so the overlap is a plain window conflict;
+            # 1. same scope layer + overlap, regardless of label conditions:
+            #    the groups coexist in the same name/layer and are active at
+            #    the same time, so the overlap is a plain window conflict
+            #    even when their match_labels differ;
             by_key: dict[tuple, list[ReleaseGroup]] = {}
             for g in groups:
                 by_key.setdefault(g.key(), []).append(g)
             for key, gs in by_key.items():
                 for i, a in enumerate(gs):
                     for b in gs[i + 1:]:
-                        if a.match_labels == b.match_labels and windows_overlap(
+                        if windows_overlap(
                             a.window_start, a.window_end,
                             b.window_start, b.window_end,
                         ):
                             raise ValueError(
                                 f"overlapping windows for release groups {a.id!r} "
-                                f"and {b.id!r} in {key} with identical label "
-                                f"conditions"
+                                f"and {b.id!r} with the same name and scope "
+                                f"layer {key}"
                             )
             # 2. same priority + compatible label conditions + overlap:
             #    either group could win for the same client, which priority
