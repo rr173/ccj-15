@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "defaults": {"negative_ttl": 30},
+  "rules": [
+    {
+      "name": "api",
+      "scope": "global",
+      "rule_version": 1,
+      "ttl": 60,
+      "targets": [
+        {"id": "b1", "address": "http://backend1:80", "weight": 3},
+        {"id": "b2", "address": "http://backend2:80", "weight": 1}
+      ]
+    },
+    {
+      "name": "api",
+      "scope": "region",
+      "region": "eu",
+      "rule_version": 1,
+      "ttl": 60,
+      "targets": [
+        {"id": "b2", "address": "http://backend2:80", "weight": 1}
+      ]
+    },
+    {
+      "name": "api",
+      "scope": "tenant",
+      "tenant": "vip",
+      "rule_version": 1,
+      "ttl": 30,
+      "targets": [
+        {"id": "b1", "address": "http://backend1:80", "weight": 1}
+      ]
+    }
+  ]
+}

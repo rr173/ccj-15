@@ -1,0 +1,45 @@
+# Two resolver nodes sharing one config file, plus two demo backends.
+# Both nodes watch the same mounted config; bump its "version" and both
+# apply it within ~1s (GEORESOLVE_CONFIG_POLL).
+services:
+  node1:
+    build: .
+    ports:
+      - "8081:8080"
+    environment:
+      GEORESOLVE_DB_PATH: /data/georesolve.db
+      GEORESOLVE_CONFIG_FILE: /config/config.json
+      GEORESOLVE_ADMIN_TOKEN: dev-token
+    volumes:
+      - ./config:/config:ro
+      - node1-data:/data
+    depends_on:
+      - backend1
+      - backend2
+
+  node2:
+    build: .
+    ports:
+      - "8082:8080"
+    environment:
+      GEORESOLVE_DB_PATH: /data/georesolve.db
+      GEORESOLVE_CONFIG_FILE: /config/config.json
+      GEORESOLVE_ADMIN_TOKEN: dev-token
+    volumes:
+      - ./config:/config:ro
+      - node2-data:/data
+    depends_on:
+      - backend1
+      - backend2
+
+  backend1:
+    image: traefik/whoami:latest
+    command: ["--port", "80"]
+
+  backend2:
+    image: traefik/whoami:latest
+    command: ["--port", "80"]
+
+volumes:
+  node1-data:
+  node2-data:
