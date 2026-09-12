@@ -58,6 +58,76 @@ CREATE TABLE IF NOT EXISTS authz_emergency_grants (
 );
 CREATE INDEX IF NOT EXISTS idx_emergency_identity
     ON authz_emergency_grants(identity_id, status);
+CREATE TABLE IF NOT EXISTS usage_events (
+    event_id      TEXT PRIMARY KEY,
+    event_time    REAL NOT NULL,
+    recorded_at   REAL NOT NULL,
+    tenant        TEXT NOT NULL,
+    client_key    TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    region        TEXT NOT NULL DEFAULT '',
+    labels_sig    TEXT NOT NULL DEFAULT '',
+    rule_scope    TEXT NOT NULL,
+    rule_version  INTEGER,
+    group_id      TEXT,
+    config_version INTEGER NOT NULL,
+    result        TEXT NOT NULL,
+    quantity      REAL NOT NULL,
+    degraded      INTEGER NOT NULL DEFAULT 0,
+    source        TEXT NOT NULL DEFAULT 'live',
+    backfilled_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_events(event_time);
+CREATE INDEX IF NOT EXISTS idx_usage_tenant_time ON usage_events(tenant, event_time);
+CREATE INDEX IF NOT EXISTS idx_usage_client_time ON usage_events(tenant, client_key, event_time);
+CREATE INDEX IF NOT EXISTS idx_usage_scope_time
+    ON usage_events(tenant, rule_scope, event_time);
+CREATE TABLE IF NOT EXISTS usage_aggregates (
+    period_type  TEXT NOT NULL,
+    period_start REAL NOT NULL,
+    tenant       TEXT NOT NULL,
+    client_key   TEXT NOT NULL DEFAULT '',
+    rule_scope   TEXT NOT NULL DEFAULT '',
+    events       INTEGER NOT NULL,
+    quantity     REAL NOT NULL,
+    allowed_qty  REAL NOT NULL,
+    rejected_qty REAL NOT NULL,
+    degraded_qty REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (period_type, period_start, tenant, client_key, rule_scope)
+);
+CREATE INDEX IF NOT EXISTS idx_agg_tenant
+    ON usage_aggregates(period_type, period_start, tenant);
+CREATE TABLE IF NOT EXISTS budgets (
+    tenant           TEXT PRIMARY KEY,
+    period_type      TEXT NOT NULL,
+    amount           REAL NOT NULL,
+    alert_thresholds TEXT NOT NULL,
+    over_policy      TEXT NOT NULL,
+    version          INTEGER NOT NULL,
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    created_by       TEXT,
+    updated_by       TEXT
+);
+CREATE TABLE IF NOT EXISTS budget_alerts (
+    id           TEXT PRIMARY KEY,
+    tenant       TEXT NOT NULL,
+    period_type  TEXT NOT NULL,
+    period_start REAL NOT NULL,
+    threshold    REAL NOT NULL,
+    usage        REAL NOT NULL,
+    budget_amount REAL NOT NULL,
+    event_id     TEXT,
+    fired_at     REAL NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'open',
+    acknowledged_by TEXT,
+    acknowledged_at REAL,
+    comment      TEXT,
+    version      INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(tenant, period_type, period_start, threshold)
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON budget_alerts(tenant, status);
 """
 
 

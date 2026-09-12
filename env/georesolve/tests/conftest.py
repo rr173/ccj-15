@@ -80,7 +80,9 @@ def make_stack(db_path: str, clock: FakeClock) -> SimpleNamespace:
     config.add_listener(
         rate_limiter.replace_buckets, rate_limiter.preview_replace
     )
-    resolver = Resolver(config, cache, health, audit, rate_limiter, clock)
+    resolver = Resolver(
+        config, cache, health, audit, rate_limiter, clock=clock
+    )
     return SimpleNamespace(
         clock=clock, audit=audit, config=config, cache=cache,
         health=health, rate_limiter=rate_limiter, resolver=resolver,

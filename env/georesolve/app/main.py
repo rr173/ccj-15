@@ -103,6 +103,15 @@ from .config_store import (
     VersionNotFound,
 )
 from .health import HealthChecker, HealthRegistry
+from .metering import (
+    BudgetExceeded,
+    BudgetSpec,
+    MeteringConflict,
+    MeteringNotFound,
+    MeteringStore,
+    MeteringValidationError,
+    PERIOD_TYPES,
+)
 from .models import ConfigBundle
 from .rate_limit import RateLimitExceeded, RateLimiter
 from .resolver import Resolver
@@ -194,6 +203,91 @@ class EmergencyGrantRevokeRequest(BaseModel):
     expected_version: Optional[int] = Field(default=None, ge=1)
 
 
+class BackfillEvent(BaseModel):
+    event_id: Optional[str] = None
+    event_time: float = Field(allow_inf_nan=False)
+    tenant: str
+    client_key: str = ""
+    name: str = ""
+    region: str = ""
+    labels_sig: str = ""
+    rule_scope: Optional[str] = None  # inferred from region/tenant when absent
+    rule_version: Optional[int] = Field(default=None, ge=1)
+    group_id: Optional[str] = None
+    config_version: int = Field(default=0, ge=0)
+    result: str = "served"
+    quantity: float = Field(default=1.0, ge=0)
+    degraded: bool = False
+
+    @field_validator("tenant")
+    @classmethod
+    def _tenant_nonempty(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if not v:
+            raise ValueError("backfill events require a tenant")
+        return v
+
+    @field_validator("result")
+    @classmethod
+    def _known_result(cls, v: str) -> str:
+        if v not in ("served", "budget_degraded", "budget_rejected"):
+            raise ValueError(
+                "result must be served, budget_degraded or budget_rejected"
+            )
+        return v
+
+    def to_record(self) -> dict:
+        scope = self.rule_scope or (
+            "tenant" if self.tenant else ("region" if self.region else "global")
+        )
+        if scope not in ("global", "region", "tenant"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid rule_scope {scope!r}",
+            )
+        return {
+            "event_id": self.event_id,
+            "event_time": self.event_time,
+            "tenant": self.tenant,
+            "client_key": self.client_key,
+            "name": self.name,
+            "region": self.region,
+            "labels_sig": self.labels_sig,
+            "rule_scope": scope,
+            "rule_version": self.rule_version,
+            "group_id": self.group_id,
+            "config_version": self.config_version,
+            "result": self.result,
+            "quantity": self.quantity,
+            "degraded": self.degraded,
+        }
+
+
+class BackfillRequest(BaseModel):
+    events: list[BackfillEvent] = Field(min_length=1, max_length=10_000)
+
+
+class RecomputeRequest(BaseModel):
+    tenant: Optional[str] = None
+    start: Optional[float] = Field(default=None, allow_inf_nan=False)
+    end: Optional[float] = Field(default=None, allow_inf_nan=False)
+
+
+class BudgetUpsertRequest(BaseModel):
+    period_type: str = "day"
+    amount: float = Field(gt=0, allow_inf_nan=False)
+    alert_thresholds: list[float] = Field(
+        default_factory=lambda: [0.8, 1.0]
+    )
+    over_policy: str = "reject"
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
+class AlertAckRequest(BaseModel):
+    comment: Optional[str] = None
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
 class Components:
     def __init__(
         self,
@@ -223,6 +317,7 @@ class Components:
         self.cache = ResolutionCache(time.time)
         self.health = HealthRegistry()
         self.rate_limiter = RateLimiter(self.audit, time.time)
+        self.metering = MeteringStore(db, self.audit, time.time)
         self.config.add_listener(
             self.rate_limiter.replace_buckets,
             self.rate_limiter.preview_replace,
@@ -233,6 +328,7 @@ class Components:
             self.health,
             self.audit,
             self.rate_limiter,
+            self.metering,
         )
         self.checker = HealthChecker(
             self.health,
@@ -320,6 +416,31 @@ def create_app(components: Components) -> FastAPI:
     @app.exception_handler(AuthzConflict)
     async def _conflict(_req, exc: AuthzConflict):
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(BudgetExceeded)
+    async def _budget_exceeded(_req, exc: BudgetExceeded):
+        d = exc.decision
+        return JSONResponse(
+            status_code=402,
+            content={
+                "detail": d.reason,
+                "reason": d.reason,
+                "event_id": exc.event_id,
+                "budget": d.public(),
+            },
+        )
+
+    @app.exception_handler(MeteringNotFound)
+    async def _metering_not_found(_req, exc: MeteringNotFound):
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @app.exception_handler(MeteringConflict)
+    async def _metering_conflict(_req, exc: MeteringConflict):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(MeteringValidationError)
+    async def _metering_validation(_req, exc: MeteringValidationError):
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
 
     async def authenticated(
         authorization: Optional[str] = Header(default=None),
@@ -584,11 +705,15 @@ def create_app(components: Components) -> FastAPI:
         tenant: str = "",
         client: Optional[str] = None,
         labels: str = "",
+        x_request_id: Optional[str] = Header(
+            default=None, alias="X-Request-Id"
+        ),
     ):
         client_key = client or (request.client.host if request.client else "")
         try:
             return comp.resolver.resolve(
-                name, region, tenant, client_key, labels=parse_labels(labels)
+                name, region, tenant, client_key,
+                labels=parse_labels(labels), request_id=x_request_id,
             )
         except RateLimitExceeded as exc:
             return rate_limited(exc)
@@ -890,6 +1015,296 @@ def create_app(components: Components) -> FastAPI:
              "config_version": comp.config.snapshot().version},
         )
         return {"flushed": n}
+
+    # -- metering & budgets --------------------------------------------------
+
+    def tenant_scope(tenant: str) -> Scope:
+        return Scope(scope="tenant", tenant=tenant)
+
+    def authorize_tenants(
+        caller: Caller, action: str, tenants: list[str]
+    ) -> None:
+        """Authorize an action on a set of tenant resources."""
+        comp.authz.authorize(
+            caller, action, [tenant_scope(t) for t in tenants if t]
+        )
+
+    def visible_tenant_grants(caller: Caller, action: str) -> list[Scope]:
+        return caller.grants(action)
+
+    def tenant_visible(caller: Caller, action: str, tenant: str) -> bool:
+        if caller.kind in ("bootstrap", "open"):
+            return True
+        return any(
+            g.covers(tenant_scope(tenant)) for g in caller.grants(action)
+        )
+
+    def filter_tenant_rows(caller: Caller, action: str, rows: list[dict]):
+        if caller.kind in ("bootstrap", "open"):
+            return rows
+        return [r for r in rows if tenant_visible(caller, action, r["tenant"])]
+
+    @app.get("/v1/metering/events")
+    async def metering_events(
+        tenant: Optional[str] = Query(default=None),
+        client: Optional[str] = Query(default=None),
+        rule_scope: Optional[str] = Query(default=None),
+        start: Optional[float] = Query(default=None),
+        end: Optional[float] = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=5000),
+        caller: Caller = Depends(authenticated),
+    ):
+        if rule_scope is not None and rule_scope not in (
+            "global", "region", "tenant"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="rule_scope must be global, region or tenant",
+            )
+        if start is not None and end is not None and end < start:
+            raise HTTPException(status_code=400, detail="end before start")
+        # Authorization: a single-tenant query needs coverage of that
+        # tenant; a global listing needs the action at all, and the output
+        # is afterwards filtered to covered tenants.
+        if tenant is not None:
+            authorize_tenants(caller, "metering:read", [tenant])
+        else:
+            comp.authz.authorize(caller, "metering:read")
+        events = comp.metering.list_events(
+            tenant=tenant, client_key=client, rule_scope=rule_scope,
+            start=start, end=end, limit=limit,
+        )
+        if tenant is None:
+            events = filter_tenant_rows(caller, "metering:read", events)
+        return {
+            "events": events,
+            "window": {"start": start, "end": end},
+            "count": len(events),
+        }
+
+    @app.get("/v1/metering/aggregates")
+    async def metering_aggregates(
+        period: str = Query(default="day"),
+        tenant: Optional[str] = Query(default=None),
+        client: Optional[str] = Query(default=None),
+        start: Optional[float] = Query(default=None),
+        end: Optional[float] = Query(default=None),
+        group_by_client: bool = Query(default=False),
+        group_by_scope: bool = Query(default=False),
+        caller: Caller = Depends(authenticated),
+    ):
+        if period not in PERIOD_TYPES:
+            raise HTTPException(
+                status_code=400, detail=f"period must be one of {PERIOD_TYPES}"
+            )
+        if start is not None and end is not None and end < start:
+            raise HTTPException(status_code=400, detail="end before start")
+        # A specific tenant must be covered; a global listing is afterwards
+        # filtered to the tenants the caller can see.
+        if tenant is not None:
+            authorize_tenants(caller, "metering:read", [tenant])
+        else:
+            comp.authz.authorize(caller, "metering:read")
+        try:
+            rows = comp.metering.aggregates(
+                tenant=tenant, period_type=period, start=start, end=end,
+                group_by_client=group_by_client or client is not None,
+                group_by_scope=group_by_scope,
+            )
+        except MeteringValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if client is not None:
+            rows = [r for r in rows if r.get("client_key") == client]
+        if tenant is None:
+            rows = filter_tenant_rows(caller, "metering:read", rows)
+        return {"period_type": period, "buckets": rows, "count": len(rows)}
+
+    @app.post("/v1/metering/backfill", status_code=201)
+    async def metering_backfill(
+        req: BackfillRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        records = [e.to_record() for e in req.events]
+        tenants = sorted({r["tenant"] for r in records if r["tenant"]})
+        authorize_tenants(caller, "metering:backfill", tenants)
+
+        def produce():
+            result = comp.metering.backfill(records, actor=caller.identity_id)
+            return 201, result
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"events": records}, produce,
+        )
+
+    @app.post("/v1/metering/recompute")
+    async def metering_recompute(
+        req: RecomputeRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        # Recomputation rewrites aggregates; scoped to one tenant for
+        # tenant-scoped callers, global only for global callers.
+        if req.tenant:
+            authorize_tenants(caller, "metering:recompute", [req.tenant])
+        else:
+            comp.authz.authorize(
+                caller, "metering:recompute", [Scope()]
+            )
+
+        def produce():
+            result = comp.metering.recompute(
+                actor=caller.identity_id,
+                tenant=req.tenant, start=req.start, end=req.end,
+            )
+            return 200, result
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.get("/v1/budgets")
+    async def list_budgets(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "budget:read")
+        budgets = comp.metering.list_budgets()
+        return {"budgets": filter_tenant_rows(caller, "budget:read", budgets)}
+
+    @app.get("/v1/budgets/{tenant}")
+    async def get_budget(
+        tenant: str, caller: Caller = Depends(authenticated)
+    ):
+        comp.authz.authorize(
+            caller, "budget:read", [tenant_scope(tenant)]
+        )
+        status = comp.metering.budget_status(tenant)
+        if status is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no budget configured for tenant {tenant!r}",
+            )
+        return status
+
+    @app.put("/v1/budgets/{tenant}")
+    async def put_budget(
+        tenant: str,
+        req: BudgetUpsertRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        try:
+            spec = BudgetSpec(
+                tenant=tenant,
+                period_type=req.period_type,
+                amount=req.amount,
+                alert_thresholds=req.alert_thresholds,
+                over_policy=req.over_policy,
+                expected_version=req.expected_version,
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422, detail=json.loads(exc.json())
+            )
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(tenant)]
+        )
+
+        def produce():
+            budget, created = comp.metering.upsert_budget(
+                spec, actor=caller.identity_id
+            )
+            return (201 if created else 200), {
+                "budget": budget, "created": created
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"tenant": tenant, **req.model_dump()}, produce,
+        )
+
+    @app.delete("/v1/budgets/{tenant}")
+    async def delete_budget(
+        tenant: str,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(tenant)]
+        )
+
+        def produce():
+            comp.metering.delete_budget(tenant, actor=caller.identity_id)
+            return 200, {"deleted": tenant}
+
+        return run_idempotent(idempotency_key, request, caller, {}, produce)
+
+    @app.get("/v1/budget-alerts")
+    async def list_budget_alerts(
+        tenant: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        period: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        if status is not None and status not in ("open", "acknowledged"):
+            raise HTTPException(
+                status_code=400,
+                detail="status must be 'open' or 'acknowledged'",
+            )
+        if period is not None and period not in PERIOD_TYPES:
+            raise HTTPException(
+                status_code=400, detail=f"period must be one of {PERIOD_TYPES}"
+            )
+        if tenant is not None:
+            authorize_tenants(caller, "budget:read", [tenant])
+        else:
+            comp.authz.authorize(caller, "budget:read")
+        alerts = comp.metering.list_alerts(
+            tenant=tenant, status=status, period_type=period, limit=limit
+        )
+        if tenant is None:
+            alerts = filter_tenant_rows(caller, "budget:read", alerts)
+        return {"alerts": alerts, "count": len(alerts)}
+
+    @app.post("/v1/budget-alerts/{alert_id}/acknowledge")
+    async def acknowledge_budget_alert(
+        alert_id: str,
+        req: AlertAckRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        alert = comp.metering.get_alert(alert_id)
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(alert["tenant"])]
+        )
+
+        def produce():
+            acked, changed = comp.metering.acknowledge_alert(
+                alert_id,
+                actor=caller.identity_id,
+                comment=req.comment,
+                expected_version=req.expected_version,
+            )
+            return 200, {"alert": acked, "changed": changed}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
 
     # -- admin delegation ----------------------------------------------------
 

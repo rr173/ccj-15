@@ -20,6 +20,16 @@ Resolution pipeline for (name, region, tenant, client_key, labels):
    signature). This happens before the cache read, so cache hits consume
    quota; a rejected request neither reads a cached answer through the
    resolver pipeline nor writes a new cache entry.
+3b. Metering/budget gate (when configured): the request is charged one unit
+   against the tenant's current daily/monthly budget *before* the cache
+   read. Over budget, policy ``reject`` archives a zero-quantity
+   ``budget_rejected`` event (so the denial is replayable/explainable) and
+   raises BudgetExceeded (HTTP 402); policy ``degrade`` proceeds but flags
+   the answer ``budget_degraded``; policy ``allow`` proceeds normally.
+   Every request that passes the gate archives exactly one idempotent
+   usage event after the answer is produced -- cache hits included --
+   keyed by its event id (``X-Request-Id`` header or server-generated), so
+   a retried request is never billed twice.
 4. Look up the cache by the exact (name, region, tenant, client, labels)
    key -- the ranking depends on the client key and the group decision
    on the labels, so answers are cached per client per label set and
@@ -52,6 +62,14 @@ from .audit import AuditLog
 from .cache import CacheEntry, ResolutionCache
 from .config_store import ConfigManager, Snapshot
 from .health import HealthRegistry
+from .metering import (
+    BudgetDecision,
+    BudgetExceeded,
+    MeteringStore,
+    RESULT_DEGRADED,
+    RESULT_REJECTED,
+    RESULT_SERVED,
+)
 from .models import (
     ReleaseGroup,
     Rule,
@@ -64,6 +82,15 @@ from .selection import gray_bucket, rank_targets
 
 def _norm(value: str) -> str:
     return (value or "").strip().lower()
+
+
+def _request_scope(region: str, tenant: str) -> str:
+    """Scope layer a request resolved against when no rule existed."""
+    if tenant:
+        return "tenant"
+    if region:
+        return "region"
+    return "global"
 
 
 @dataclass
@@ -87,6 +114,7 @@ class Resolver:
         health: HealthRegistry,
         audit: AuditLog,
         rate_limiter: Optional[RateLimiter] = None,
+        metering: Optional[MeteringStore] = None,
         clock: Callable[[], float] = time.time,
     ):
         self._config = config
@@ -94,6 +122,7 @@ class Resolver:
         self._health = health
         self._audit = audit
         self._rate_limiter = rate_limiter
+        self._metering = metering
         self._clock = clock
         config.add_listener(self._on_config_applied, self.preview_config_impact)
 
@@ -172,6 +201,7 @@ class Resolver:
         client_key: str = "",
         labels: Optional[Mapping[str, str]] = None,
         now: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> dict:
         now = self._clock() if now is None else now
         name, region, tenant = _norm(name), _norm(region), _norm(tenant)
@@ -202,7 +232,27 @@ class Resolver:
                 if not rate_decision.allowed:
                     raise RateLimitExceeded(rate_decision)
 
+        # Resolve the effective rule before the budget gate so that even a
+        # rejected request is archived with the scope of the rule it would
+        # have been served by (the producing rule may live at a broader
+        # layer than the request's own tenant/region).
         rule = snap.effective_rule(name, region, tenant, now)
+
+        # Budget gate, also before the cache read (a denied request neither
+        # serves from cache nor writes a cache entry). The projected charge
+        # is one unit; only tenants with a configured budget are gated.
+        budget_decision: Optional[BudgetDecision] = None
+        if self._metering is not None and tenant:
+            budget_decision = self._metering.check(tenant, now=now)
+            if not budget_decision.allowed:
+                stored = self._record_usage(
+                    tenant, key, name, region, sig, snap,
+                    rule=rule, gray=None,
+                    result=RESULT_REJECTED, degraded=False,
+                    now=now, request_id=request_id,
+                )
+                raise BudgetExceeded(budget_decision, stored["event_id"])
+
         decision = self._evaluate_gray(snap, name, region, tenant, labels, key, now)
         fingerprint = rule.fingerprint() if rule else None
         active_targets = (
@@ -212,36 +262,102 @@ class Resolver:
         )
         health_sig = self._health_signature(active_targets)
 
+        budget_degraded = bool(budget_decision and budget_decision.degraded)
         entry = self._cache.get(name, region, tenant, key, sig)
+        cached = False
         if entry is not None:
             stale_reason = self._staleness(
                 entry, fingerprint, health_sig, decision.token
             )
             if stale_reason is None:
-                return self._answer(entry, snap, now, True, rate_decision)
-            self._cache.evict(entry.key())
-            self._audit.record(
-                "cache_invalidation",
-                {
-                    "name": name,
-                    "region": region,
-                    "tenant": tenant,
-                    "reason": stale_reason,
-                    "old_rule_version": entry.rule_version,
-                    "new_rule_version": rule.rule_version if rule else None,
-                    "group_id": entry.group_id,
-                    "new_group_id": decision.group.id
-                    if decision.hit and decision.group
-                    else None,
-                    "config_version": snap.version,
-                },
+                cached = True
+            else:
+                self._cache.evict(entry.key())
+                self._audit.record(
+                    "cache_invalidation",
+                    {
+                        "name": name,
+                        "region": region,
+                        "tenant": tenant,
+                        "reason": stale_reason,
+                        "old_rule_version": entry.rule_version,
+                        "new_rule_version": rule.rule_version if rule else None,
+                        "group_id": entry.group_id,
+                        "new_group_id": decision.group.id
+                        if decision.hit and decision.group
+                        else None,
+                        "config_version": snap.version,
+                    },
+                )
+                entry = None
+        if entry is None:
+            entry = self._compute(
+                snap, rule, decision, name, region, tenant, key, sig, labels, now
             )
+            self._cache.put(entry)
 
-        entry = self._compute(
-            snap, rule, decision, name, region, tenant, key, sig, labels, now
+        answer = self._answer(entry, snap, now, cached, rate_decision)
+        if self._metering is not None and tenant:
+            result = RESULT_DEGRADED if budget_degraded else RESULT_SERVED
+            stored = self._record_usage(
+                tenant, key, name, region, sig, snap,
+                rule=rule, gray=decision,
+                result=result, degraded=budget_degraded,
+                now=now, request_id=request_id,
+            )
+            answer["event_id"] = stored["event_id"]
+            answer["duplicate_event"] = stored["duplicate"]
+        answer["budget"] = (
+            budget_decision.public() if budget_decision is not None else None
         )
-        self._cache.put(entry)
-        return self._answer(entry, snap, now, False, rate_decision)
+        if budget_degraded:
+            answer["degraded"] = True
+            answer["degrade_reasons"] = sorted(
+                set(answer.get("degrade_reasons") or []) | {"budget_exceeded"}
+            )
+        return answer
+
+    def _record_usage(
+        self,
+        tenant: str,
+        client_key: str,
+        name: str,
+        region: str,
+        labels_sig: str,
+        snap: Snapshot,
+        *,
+        rule: Optional[Rule],
+        gray: Optional[GrayDecision],
+        result: str,
+        degraded: bool,
+        now: float,
+        request_id: Optional[str],
+    ) -> dict:
+        """Archive the one usage event for this request (idempotent).
+
+        Rejected requests are archived with zero quantity so the denial is
+        explainable and replayable without consuming budget; the event id
+        makes a retried request bill at most once.
+        """
+        group = gray.group if gray is not None and gray.hit else None
+        return self._metering.record_event(  # type: ignore[union-attr]
+            tenant=tenant,
+            client_key=client_key,
+            name=name,
+            region=region,
+            labels_sig=labels_sig,
+            rule_scope=(group.scope if group is not None else (rule.scope if rule is not None else _request_scope(region, tenant))),
+            rule_version=group.rule_version if group is not None
+            else (rule.rule_version if rule is not None else None),
+            group_id=group.id if group is not None else None,
+            config_version=snap.version,
+            result=result,
+            quantity=0.0 if result == RESULT_REJECTED else 1.0,
+            degraded=degraded,
+            event_time=now,
+            event_id=request_id,
+            source="live",
+        )
 
     def _compute(
         self,
@@ -625,6 +741,10 @@ class Resolver:
 
         rate_limit_info = rate_decision.public() if rate_decision else None
 
+        budget_info = None
+        if self._metering is not None and tenant:
+            budget_info = self._metering.check(tenant, now=now).public()
+
         return {
             "name": name,
             "region": region,
@@ -632,6 +752,7 @@ class Resolver:
             "now": now,
             "config_version": snap.version,
             "rate_limit": rate_limit_info,
+            "budget": budget_info,
             "effective_rule": rule_info,
             "selection": selection,
             "release": {

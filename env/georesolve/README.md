@@ -76,6 +76,54 @@
   （命中，含分桶、百分比、窗口、标签）、缓存失效记录携带 `group_id`，
   灰度决策变化导致的失效原因为 `release_group_changed`。
 
+## 解析用量计量与预算告警
+
+每次解析（缓存命中也不例外）在通过限流与预算闸门后产生**一条可重放的用量事件**，
+全部落 SQLite，重启后明细、聚合、预算状态与未确认告警都保持。
+
+### 事件、幂等与事件时间归档
+- 事件字段：`event_id`、`event_time`（事件时间）、`recorded_at`（录入时间）、
+  租户、客户端、名字、区域、标签签名、**生效规则作用域**（实际产出答案的规则所在层，
+  可能比请求的租户层更宽）、`rule_version`/`group_id`/`config_version`、结果
+  （`served`/`budget_degraded`/`budget_rejected`）、计费量与来源（`live`/`backfill`）。
+- 事件写入按 `event_id` 幂等：数据面可用 `X-Request-Id` 头携带客户端事件键，
+  不带时服务端生成；同键重试重放原事件、**绝不重复计费**。
+- 明细按 **event_time** 归档（不是入库时间），并在同一笔立即事务里增量折叠进
+  日/月聚合行（UTC 对齐边界，按 租户×客户端×规则作用域 细分）。乱序、迟到事件
+  落入其事件时间所属的周期；`POST /v1/metering/recompute` 以不可变明细为唯一事实源
+  重建受影响聚合，重算后明细与所有聚合严格一致。
+- 在线事件的 `event_time` 不允许显著超前于服务端时钟（默认 60s，防未来时间污染）；
+  补录事件只受有限值校验。
+
+### 预算、阈值与超预算策略
+- 管理员用 `PUT /v1/budgets/{tenant}` 为租户设置：周期 `day`/`month`（UTC 边界，
+  跨周期自动重置）、预算量 `amount`、阈值列表 `alert_thresholds`（预算的比例，如
+  `0.8`/`1.0`）、超预算策略 `over_policy`：
+  - `allow`：照常服务，仅计量（响应预算段 `reason=over_budget_allow`）；
+  - `degrade`：照常计算但答案带 `degraded: true` 与 `degrade_reasons:[budget_exceeded]`，
+    仍按一单位计量，结果记为 `budget_degraded`；
+  - `reject`：在读取/写入解析缓存**之前**拒绝，HTTP **402**，响应体含可解释的预算段
+    （周期、已用、余量、策略、未确认告警）；拒绝本身归档一条 **0 计费量**的
+    `budget_rejected` 事件，使拒绝也可重放、可解释，且不消耗预算。
+- 闸门投影"当前用量 + 本次一单位"，因此恰好在用尽的那次请求被拒。`GET /v1/explain`
+  返回同样的投影但**不计量、不产生任何事件**。
+- 每越过一个阈值，在 `(租户, 周期, 阈值)` 上恰好生成一条 `open` 审计告警（唯一约束
+  加进程锁保证 exactly-once）；迟到/补录事件把历史周期推过阈值时补记 **retroactive**
+  告警，重算也只补缺、从不删除已有告警。告警用 `POST .../acknowledge` 确认，
+  未确认告警跨重启保持。
+
+### 并发、权限与审计
+- 预算行与告警行带单调 `version`，写接口支持 `expected_version` 乐观并发（冲突 409）；
+- 所有写接口支持 `Idempotency-Key`：首个响应持久化，重复提交重放（不重复写事件/审计/
+  版本），同键不同载荷 409；同内容预算 PUT 是无变化 no-op，重复确认返回 `changed:false`。
+- 权限动作：`metering:read`（明细/聚合查看）、`metering:backfill`（补录，须覆盖全部
+  涉及租户）、`metering:recompute`（重算，全量仅全局作用域）、`budget:read`、
+  `budget:write`。作用域与规则同构（global ⊇ region ⊇ tenant）：区域管理员可管理
+  任意租户预算，但租户管理员不能越权到其它租户/区域/全局；列表类接口按授权作用域过滤。
+- 审计类型：`usage_event`（每条事件，含结果/计费量/事件时间/来源/触发告警）、
+  `usage_backfill`、`usage_recompute`、`budget_change`（新旧值与版本）、
+  `budget_alert`（fired/acknowledged，含阈值、用量、周期、是否 retroactive、操作人）。
+
 ## 配置变更管理：预演、历史与回滚
 
 ### 预演（dry-run）
@@ -151,7 +199,9 @@
 ### 动作与控制面授权
 
 动作集合：`config:read`、`config:write`、`versions:read`、`cache:read`、`cache:flush`、
-`health:read`、`health:write`、`audit:read`、`admin:manage`。每个控制面请求先认证
+`health:read`、`health:write`、`audit:read`、`admin:manage`、
+`metering:read`、`metering:backfill`、`metering:recompute`、
+`budget:read`、`budget:write`。每个控制面请求先认证
 （失败 **401**），再按动作与资源作用域授权（越权 **403**，且授权在任何变更之前完成，
 **被拒绝的请求不会产生配置或缓存副作用**）。允许与拒绝都写入审计
 （`authz_decision` / `authz_denied`）。
@@ -230,8 +280,8 @@
 
 | 接口 | 说明 |
 |---|---|
-| `GET /v1/resolve?name=&region=&tenant=&client=&labels=` | 解析名字，返回答案（含 `rule_version`、`release_group`、`chosen`、有序目标列表、TTL、`rate_limit`）；超限返回 429 和 `Retry-After`；`labels` 形如 `env=canary,team=pay` |
-| `GET /v1/explain?name=&region=&tenant=&client=&labels=` | 查询当前采用的规则版本、目标、生效时间、灰度命中与原因、限流档位/剩余额度/拒绝原因、缓存状态、下次切换时间；不消耗限流令牌 |
+| `GET /v1/resolve?name=&region=&tenant=&client=&labels=` | 解析名字，返回答案（含 `rule_version`、`release_group`、`chosen`、有序目标列表、TTL、`rate_limit`、`budget`、`event_id`）；限流返回 429/`Retry-After`，预算超支按策略返回 402 或带 `budget_exceeded` 降级标记；可带 `X-Request-Id` 作为用量事件幂等键；`labels` 形如 `env=canary,team=pay` |
+| `GET /v1/explain?name=&region=&tenant=&client=&labels=` | 查询当前采用的规则版本、目标、生效时间、灰度命中与原因、限流档位/剩余额度/拒绝原因、**预算投影（只预测不计量）**、缓存状态、下次切换时间；不消耗限流令牌也不写用量事件 |
 | `GET /healthz` | 存活探针 |
 
 控制面（需认证：`Authorization: Bearer <token>`，令牌为身份令牌或
@@ -246,10 +296,19 @@
 | `GET /v1/config/versions/{v}?payload=true` | 单个已保存版本：摘要、差异与（按作用域过滤的）bundle |
 | `POST /v1/config/rollback` | 回滚到已保存版本：以其内容生成**更高的新版本**，走与普通应用相同的校验、缓存失效、桶重置与审计流程；可带 `expected_version`/`preview_token`；仅全局作用域 |
 | `POST /v1/config/rollback/preview` | 回滚预演（不落任何变更）；仅全局作用域 |
-| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback`、`authz_decision`、`authz_denied`、`identity_change`、`role_change`、`emergency_grant`；按 `audit:read` 作用域过滤 |
+| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback`、`authz_decision`、`authz_denied`、`identity_change`、`role_change`、`emergency_grant`、`usage_event`、`usage_backfill`、`usage_recompute`、`budget_change`、`budget_alert`；按 `audit:read` 作用域过滤（记录带 `tenant`/`scope`） |
 | `GET /v1/health/targets` | 目标健康视图，按 `health:read` 作用域过滤 |
 | `POST /v1/health/targets/{id}` | 手工健康覆盖（`{"healthy": bool}`）；要求目标的所有引用都在调用者 `health:write` 作用域内；写审计 |
 | `GET /v1/cache` / `POST /v1/cache/flush` | 缓存查看（按 `cache:read` 过滤）/ 按 `cache:flush` 作用域清空（清空会记审计） |
+| `GET /v1/metering/events?tenant=&client=&rule_scope=&start=&end=` | 按**事件时间**窗口查询可重放用量明细（每条含租户、客户端、名字、区域、生效规则作用域、结果、计费量、事件/录入时间）；按 `metering:read` 作用域授权与过滤 |
+| `GET /v1/metering/aggregates?period=day\|month&tenant=&start=&end=&group_by_client=&group_by_scope=` | 日/月窗口聚合统计（事件数、计费量、served/degraded/rejected 分项），周期按 UTC 对齐事件时间 |
+| `POST /v1/metering/backfill` | 事件补录：按各自 `event_time` 归档并折叠进聚合/告警，重复 `event_id` 跳过不重复计费；需 `metering:backfill` 覆盖全部涉及租户；支持 `Idempotency-Key` |
+| `POST /v1/metering/recompute` | 以明细日志为唯一事实源重建窗口内聚合并对账阈值告警（迟到/乱序/漂移自愈，已有告警不删除，缺失穿越补记为 retroactive）；带租户时需覆盖该租户，全量重算仅全局作用域；支持 `Idempotency-Key` |
+| `GET /v1/budgets` / `GET /v1/budgets/{tenant}` | 预算列表（按 `budget:read` 过滤）/ 单租户当前周期用量、余量、使用率、周期边界与未确认告警 |
+| `PUT /v1/budgets/{tenant}` | 设置/替换租户预算（`period_type=day/month`、`amount`、`alert_thresholds`、`over_policy=allow/degrade/reject`、`expected_version`）；同内容 PUT 为无变化 no-op；需 `budget:write` 覆盖该租户；支持 `Idempotency-Key` |
+| `DELETE /v1/budgets/{tenant}` | 删除租户预算（明细与历史告警保留） |
+| `GET /v1/budget-alerts?tenant=&status=open\|acknowledged&period=day\|month` | 预算告警列表（按 `budget:read` 过滤） |
+| `POST /v1/budget-alerts/{id}/acknowledge` | 确认告警（`comment`、`expected_version`）；重复确认返回 `changed:false`；需 `budget:write` 覆盖该租户；支持 `Idempotency-Key` |
 
 管理委托（需 `admin:manage`，写接口支持 `Idempotency-Key` 幂等重试）：
 
@@ -374,7 +433,13 @@ global→region→tenant 作用域继承、作用域合并应用与定时规则�
 申请、授权范围不超出审批人可委托范围、生效授权逐请求参与配置/缓存/健康/版本
 计算、到期与撤销立即失效且旧令牌不可继续用、终态与过期状态写入 409、并发审批
 唯一成功、幂等重放、全事件持久化与审计、重启后状态与到期语义保持）、
-API 全流程（含 400/401/403/404/409/410/422/429）。
+解析用量计量与预算告警（事件按 `event_id` 幂等、`X-Request-Id` 重试不重复计费、
+迟到/乱序事件按事件时间归档、日/月聚合按租户/客户端/规则作用域分项且重算后与明细
+一致、阈值告警 exactly-once 与历史周期 retroactive 告警、allow/degrade/reject 三种
+超预算策略与 402 可解释拒绝、拒绝 0 计费但留痕、缓存命中仍计量、explain 只投影不计量、
+预算/告警乐观并发、同内容 no-op、补录与重算的租户授权和幂等键、区域/租户管理员作用域
+隔离、重启后明细/聚合/预算/未确认告警保持、并发下事件不重复计费与预算版本仅一胜）、
+API 全流程（含 400/401/402/403/404/409/410/422/429）。
 
 ## 设计说明与边界
 

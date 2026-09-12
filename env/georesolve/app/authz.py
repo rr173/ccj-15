@@ -78,6 +78,11 @@ ACTIONS = frozenset(
         "health:write",
         "audit:read",
         "admin:manage",
+        "metering:read",
+        "metering:backfill",
+        "metering:recompute",
+        "budget:read",
+        "budget:write",
     }
 )
 
