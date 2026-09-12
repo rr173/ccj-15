@@ -9,28 +9,48 @@ Data plane (unauthenticated, like a DNS resolver):
                       the release-group decision for a name/region/tenant
   GET /healthz      - liveness
 
-Control plane (requires Bearer token when GEORESOLVE_ADMIN_TOKEN is set):
-  GET  /v1/config              - current config snapshot (rules, release groups
-                                 and rate-limit tiers)
+Control plane (authenticated; see app.authz for the delegation model):
+  GET  /v1/config              - current config snapshot, filtered to the
+                                 caller's config:read scope
   POST /v1/config              - apply a new config bundle (monotonic version);
+                                 scoped callers submit only their own scope's
+                                 items, which are merged over the live config;
                                  optional expected_version (optimistic
-                                 concurrency) and preview_token (commit a
-                                 dry-run result; expired/reused/stale tokens
-                                 are rejected)
-  POST /v1/config/preview      - dry-run a bundle: full validation and impact
-                                 (rules, gray groups, cache evictions, rate
-                                 limits); changes nothing
-  GET  /v1/config/versions     - saved version summaries and diffs
-  GET  /v1/config/versions/{v} - one saved version, summary/diff and payload
+                                 concurrency) and preview_token
+  POST /v1/config/preview      - dry-run a bundle through the full pipeline
+  GET  /v1/config/versions     - saved version summaries, diffs filtered to
+                                 the caller's versions:read scope
+  GET  /v1/config/versions/{v} - one saved version; payload filtered likewise
   POST /v1/config/rollback     - restore a saved version as a brand-new,
-                                 strictly higher version through the normal
-                                 validation/cache/audit pipeline
-  POST /v1/config/rollback/preview - dry-run a rollback
-  GET  /v1/audit               - rule/group/rate-limit changes, group hits,
-                                 bucket resets, rejects and cache invalidations
-  GET  /v1/health/targets      - current target health view
-  GET  /v1/cache               - cache contents (debug)
-  POST /v1/cache/flush         - drop all cached answers (audited)
+                                 strictly higher version (global scope only)
+  POST /v1/config/rollback/preview - dry-run a rollback (global scope only)
+  GET  /v1/audit               - audit records, filtered to the caller's
+                                 audit:read scope (plus records about itself)
+  GET  /v1/health/targets      - target health view, filtered by health:read
+  POST /v1/health/targets/{id} - manual health override (health:write; audited)
+  GET  /v1/cache               - cache contents, filtered by cache:read
+  POST /v1/cache/flush         - drop cached answers inside the caller's
+                                 cache:flush scope (audited)
+
+Admin delegation (requires admin:manage; callers can only delegate scopes
+their own admin:manage grants cover, so tenant admins can never mint region
+or global permissions):
+  POST   /v1/admin/roles                 - create a role
+  GET    /v1/admin/roles                 - list visible roles
+  GET    /v1/admin/roles/{id}            - one role
+  PUT    /v1/admin/roles/{id}            - update permissions (versioned)
+  DELETE /v1/admin/roles/{id}            - delete an unassigned role
+  POST   /v1/admin/identities            - create an identity (token shown once)
+  GET    /v1/admin/identities            - list visible identities
+  GET    /v1/admin/identities/{id}       - one identity
+  PUT    /v1/admin/identities/{id}       - replace roles / rotate token
+  POST   /v1/admin/identities/{id}/deactivate - revoke access immediately
+  POST   /v1/admin/identities/{id}/reactivate - restore access
+
+All admin mutations accept an `Idempotency-Key` header: the first response
+is persisted and replayed for duplicate submissions (no duplicate version
+bumps or audit records); reusing the key with a different payload is a 409.
+Every authorization decision, denial and identity/role change is audited.
 """
 from __future__ import annotations
 
@@ -41,14 +61,25 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__
 from .audit import AuditLog
+from .authz import (
+    AuthnError,
+    AuthzConflict,
+    AuthzNotFound,
+    AuthzStore,
+    Caller,
+    Forbidden,
+    Permission,
+    Scope,
+    request_fingerprint,
+)
 from .cache import ResolutionCache
 from .config_store import (
     ConfigManager,
@@ -92,6 +123,36 @@ class RollbackRequest(BaseModel):
     new_version: Optional[int] = Field(default=None, ge=1)
 
 
+class RoleCreateRequest(BaseModel):
+    id: str
+    description: str = ""
+    permissions: list[Permission] = Field(min_length=1)
+
+
+class RoleUpdateRequest(BaseModel):
+    description: Optional[str] = None
+    permissions: Optional[list[Permission]] = Field(default=None, min_length=1)
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
+class IdentityCreateRequest(BaseModel):
+    id: str
+    roles: list[str] = Field(default_factory=list)
+    token: Optional[str] = Field(
+        default=None, description="defaults to a generated token"
+    )
+
+
+class IdentityUpdateRequest(BaseModel):
+    roles: Optional[list[str]] = None
+    rotate_token: bool = False
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
+class HealthOverrideRequest(BaseModel):
+    healthy: bool
+
+
 class Components:
     def __init__(
         self,
@@ -116,6 +177,7 @@ class Components:
 
         db = connect(db_path)
         self.audit = AuditLog(db)
+        self.authz = AuthzStore(db, self.audit, admin_token=admin_token)
         self.config = ConfigManager(db, self.audit, preview_ttl=preview_ttl)
         self.cache = ResolutionCache(time.time)
         self.health = HealthRegistry()
@@ -200,9 +262,240 @@ def create_app(components: Components) -> FastAPI:
 
     app = FastAPI(title="georesolve", version=__version__, lifespan=lifespan)
 
-    async def admin_guard(authorization: Optional[str] = Header(default=None)):
-        if comp.admin_token and authorization != f"Bearer {comp.admin_token}":
-            raise HTTPException(status_code=401, detail="invalid or missing admin token")
+    # -- authz error mapping -------------------------------------------------
+
+    @app.exception_handler(AuthnError)
+    async def _authn(_req, exc: AuthnError):
+        return JSONResponse(status_code=401, content={"detail": str(exc)})
+
+    @app.exception_handler(Forbidden)
+    async def _forbidden(_req, exc: Forbidden):
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+    @app.exception_handler(AuthzNotFound)
+    async def _not_found(_req, exc: AuthzNotFound):
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @app.exception_handler(AuthzConflict)
+    async def _conflict(_req, exc: AuthzConflict):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    async def authenticated(
+        authorization: Optional[str] = Header(default=None),
+    ) -> Caller:
+        token = None
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization[len("Bearer "):]
+        return comp.authz.authenticate(token)
+
+    # -- scope helpers ---------------------------------------------------------
+
+    def item_scope(obj) -> Scope:
+        return Scope(scope=obj.scope, region=obj.region, tenant=obj.tenant)
+
+    def full_access(caller: Caller, action: str) -> bool:
+        """True when the caller's grants cover every possible scope."""
+        if caller.kind in ("bootstrap", "open"):
+            return True
+        return any(g.scope == "global" for g in caller.grants(action))
+
+    def covered_by(grants: list[Scope], obj) -> bool:
+        scope = item_scope(obj)
+        return any(g.covers(scope) for g in grants)
+
+    def scoped_merge(bundle: ConfigBundle, grants: list[Scope]) -> ConfigBundle:
+        """Overlay a scoped caller's bundle over the live configuration.
+
+        The bundle is the full desired state *of the caller's scope*: items
+        covered by the caller's config:write grants are replaced wholesale,
+        everything outside the scope is preserved untouched. ``defaults``
+        is global state and is only changed by global callers.
+        """
+        snap = comp.config.snapshot()
+        kept_rules: dict[tuple, object] = {}
+        for r in snap.all_rules():
+            if covered_by(grants, r):
+                continue
+            # A key may hold a current plus a scheduled rule; the bundle
+            # format carries one rule per key, and the manager re-derives
+            # the scheduled pair from live state on apply.
+            cur = kept_rules.get(r.key())
+            if cur is None or r.rule_version > cur.rule_version:
+                kept_rules[r.key()] = r
+        try:
+            return ConfigBundle(
+                version=bundle.version,
+                defaults=snap.defaults,
+                rules=[*kept_rules.values(), *bundle.rules],
+                release_groups=[
+                    g for g in snap.all_release_groups()
+                    if not covered_by(grants, g)
+                ]
+                + list(bundle.release_groups),
+                rate_limit_tiers=[
+                    t for t in snap.all_rate_limit_tiers()
+                    if not covered_by(grants, t)
+                ]
+                + list(bundle.rate_limit_tiers),
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"scoped merge produced an invalid bundle: {exc}",
+            )
+
+    def authorize_config_write(caller: Caller, bundle: ConfigBundle) -> ConfigBundle:
+        """Authorize a config submission; returns the bundle to install.
+
+        Global callers apply their bundle as-is. Scoped callers must own
+        every submitted item (else 403 before anything mutates) and get a
+        bundle merged over the live config for their scope only.
+        """
+        if full_access(caller, "config:write"):
+            comp.authz.authorize(caller, "config:write")
+            return bundle
+        grants = caller.grants("config:write")
+        items = [*bundle.rules, *bundle.release_groups, *bundle.rate_limit_tiers]
+        comp.authz.authorize(
+            caller, "config:write", [item_scope(i) for i in items]
+        )
+        return scoped_merge(bundle, grants)
+
+    def filter_summary(summary: Optional[dict], grants: list[Scope]) -> Optional[dict]:
+        """Keep only the version-summary diffs covered by the grants."""
+        if summary is None:
+            return None
+
+        def cov(d: dict) -> bool:
+            try:
+                scope = Scope(
+                    scope=d.get("scope") or "global",
+                    region=d.get("region"),
+                    tenant=d.get("tenant"),
+                )
+            except ValidationError:
+                return False
+            return any(g.covers(scope) for g in grants)
+
+        out = dict(summary)
+        rule_diffs = [d for d in summary.get("rule_diffs", []) if cov(d)]
+        group_diffs = [
+            d for d in summary.get("release_group_diffs", []) if cov(d)
+        ]
+        tier_diffs = [
+            d for d in summary.get("rate_limit_tier_diffs", []) if cov(d)
+        ]
+        out["rule_diffs"] = rule_diffs
+        out["release_group_diffs"] = group_diffs
+        out["rate_limit_tier_diffs"] = tier_diffs
+        names = {d.get("name") for d in rule_diffs + group_diffs}
+        names.discard(None)
+        out["affected_names"] = sorted(names)
+        return out
+
+    def filter_bundle_dict(bundle: dict, grants: list[Scope]) -> dict:
+        """Scope-filter a serialized bundle (version history payloads)."""
+
+        def cov(d: dict) -> bool:
+            try:
+                scope = Scope(
+                    scope=d.get("scope") or "global",
+                    region=d.get("region"),
+                    tenant=d.get("tenant"),
+                )
+            except ValidationError:
+                return False
+            return any(g.covers(scope) for g in grants)
+
+        out = dict(bundle)
+        out["rules"] = [r for r in bundle.get("rules", []) if cov(r)]
+        out["release_groups"] = [
+            g for g in bundle.get("release_groups", []) if cov(g)
+        ]
+        out["rate_limit_tiers"] = [
+            t for t in bundle.get("rate_limit_tiers", []) if cov(t)
+        ]
+        return out
+
+    def record_scope(details: dict) -> Optional[Scope]:
+        """Best-effort scope extraction from an audit record's details."""
+        scope = details.get("scope")
+        if scope in ("global", "region", "tenant"):
+            try:
+                return Scope(
+                    scope=scope,
+                    region=details.get("region"),
+                    tenant=details.get("tenant"),
+                )
+            except ValidationError:
+                return None
+        rule_key = details.get("rule_key")
+        if isinstance(rule_key, str):
+            parts = rule_key.split("|")  # name|scope|region|tenant
+            if len(parts) == 4 and parts[1] in ("global", "region", "tenant"):
+                try:
+                    return Scope(
+                        scope=parts[1],
+                        region=parts[2] or None,
+                        tenant=parts[3] or None,
+                    )
+                except ValidationError:
+                    return None
+        if details.get("tenant"):
+            return Scope(scope="tenant", tenant=details["tenant"])
+        if details.get("region"):
+            return Scope(scope="region", region=details["region"])
+        return None
+
+    def audit_visible(caller: Caller, grants: list[Scope], record: dict) -> bool:
+        details = record.get("details") or {}
+        # A caller always sees records about its own requests and changes.
+        if caller.kind == "identity" and caller.identity_id in (
+            details.get("identity"),
+            details.get("actor"),
+        ):
+            return True
+        scope = record_scope(details)
+        return scope is not None and any(g.covers(scope) for g in grants)
+
+    def entry_predicate(grants: list[Scope]) -> Callable:
+        """Cache-entry visibility: entries carry (region, tenant) directly."""
+        regions = {g.region for g in grants if g.scope == "region"}
+        tenants = {g.tenant for g in grants if g.scope == "tenant"}
+
+        def visible(entry) -> bool:
+            return entry.region in regions or entry.tenant in tenants
+
+        return visible
+
+    def run_idempotent(
+        idem_key: Optional[str],
+        request: Request,
+        caller: Caller,
+        body: dict,
+        produce: Callable[[], tuple[int, dict]],
+    ) -> JSONResponse:
+        """Execute ``produce`` at most once per Idempotency-Key.
+
+        The first successful response is persisted; a duplicate submission
+        replays it (marked idempotent_replay) without re-running the
+        mutation, so retries never double-apply version bumps or audits.
+        """
+        if not idem_key:
+            status, payload = produce()
+            return JSONResponse(status_code=status, content=payload)
+        fp = request_fingerprint(
+            request.method, request.url.path, caller.identity_id, body
+        )
+        stored = comp.authz.idempotency_lookup(idem_key, fp)
+        if stored is not None:
+            return JSONResponse(
+                status_code=stored["status_code"],
+                content={**stored["body"], "idempotent_replay": True},
+            )
+        status, payload = produce()
+        comp.authz.idempotency_store(idem_key, fp, status, payload)
+        return JSONResponse(status_code=status, content=payload)
 
     def parse_labels(raw: str) -> dict:
         labels: dict[str, str] = {}
@@ -274,29 +567,28 @@ def create_app(components: Components) -> FastAPI:
 
     # -- control plane ---------------------------------------------------
 
-    @app.get("/v1/config", dependencies=[Depends(admin_guard)])
-    async def get_config():
+    @app.get("/v1/config")
+    async def get_config(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "config:read")
         snap = comp.config.snapshot()
+        rules = sorted(snap.all_rules(), key=lambda r: (r.key(), r.rule_version))
+        groups = sorted(
+            snap.all_release_groups(), key=lambda g: (g.name, g.priority, g.id)
+        )
+        tiers = sorted(
+            snap.all_rate_limit_tiers(), key=lambda t: (t.scope_key(), t.priority, t.id)
+        )
+        if not full_access(caller, "config:read"):
+            grants = caller.grants("config:read")
+            rules = [r for r in rules if covered_by(grants, r)]
+            groups = [g for g in groups if covered_by(grants, g)]
+            tiers = [t for t in tiers if covered_by(grants, t)]
         return {
             "version": snap.version,
             "defaults": snap.defaults.model_dump(),
-            "rules": [
-                r.model_dump()
-                for r in sorted(snap.all_rules(), key=lambda r: (r.key(), r.rule_version))
-            ],
-            "release_groups": [
-                g.model_dump()
-                for g in sorted(
-                    snap.all_release_groups(), key=lambda g: (g.name, g.priority, g.id)
-                )
-            ],
-            "rate_limit_tiers": [
-                t.model_dump()
-                for t in sorted(
-                    snap.all_rate_limit_tiers(),
-                    key=lambda t: (t.scope_key(), t.priority, t.id),
-                )
-            ],
+            "rules": [r.model_dump() for r in rules],
+            "release_groups": [g.model_dump() for g in groups],
+            "rate_limit_tiers": [t.model_dump() for t in tiers],
         }
 
     def render_preview(result) -> dict:
@@ -317,12 +609,17 @@ def create_app(components: Components) -> FastAPI:
             "summary": comp.config.preview_summary(result),
         }
 
-    @app.post("/v1/config", dependencies=[Depends(admin_guard)])
-    async def post_config(req: ConfigApplyRequest):
+    @app.post("/v1/config")
+    async def post_config(
+        req: ConfigApplyRequest, caller: Caller = Depends(authenticated)
+    ):
         expected = req.expected_version
         token = req.preview_token
         # ConfigApplyRequest is itself a ConfigBundle (version/defaults/...).
-        bundle = ConfigBundle(**req.model_dump(exclude={"expected_version", "preview_token"}))
+        bundle = ConfigBundle(
+            **req.model_dump(exclude={"expected_version", "preview_token"})
+        )
+        bundle = authorize_config_write(caller, bundle)
         try:
             result = comp.config.apply(
                 bundle,
@@ -345,41 +642,59 @@ def create_app(components: Components) -> FastAPI:
             "summary": result["summary"],
         }
 
-    @app.post("/v1/config/preview", dependencies=[Depends(admin_guard)])
-    async def preview_config(req: ConfigPreviewRequest):
+    @app.post("/v1/config/preview")
+    async def preview_config(
+        req: ConfigPreviewRequest, caller: Caller = Depends(authenticated)
+    ):
         if req.version is None:
             req = req.model_copy(update={"version": comp.config.snapshot().version + 1})
         bundle = ConfigBundle(
             **req.model_dump(exclude={"expected_version", "preview_token"})
         )
+        bundle = authorize_config_write(caller, bundle)
         try:
             result = comp.config.preview_bundle(bundle)
         except VersionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         return render_preview(result)
 
-    @app.get("/v1/config/versions", dependencies=[Depends(admin_guard)])
-    async def list_versions(limit: int = Query(default=50, ge=1, le=500)):
-        return {"versions": comp.config.versions(limit=limit)}
+    @app.get("/v1/config/versions")
+    async def list_versions(
+        limit: int = Query(default=50, ge=1, le=500),
+        caller: Caller = Depends(authenticated),
+    ):
+        comp.authz.authorize(caller, "versions:read")
+        versions = comp.config.versions(limit=limit)
+        if not full_access(caller, "versions:read"):
+            grants = caller.grants("versions:read")
+            for v in versions:
+                v["summary"] = filter_summary(v.get("summary"), grants)
+        return {"versions": versions}
 
-    @app.get(
-        "/v1/config/versions/{version}",
-        dependencies=[Depends(admin_guard)],
-    )
+    @app.get("/v1/config/versions/{version}")
     async def get_version(
         version: int,
         payload: bool = Query(default=True, description="include full bundle"),
+        caller: Caller = Depends(authenticated),
     ):
+        comp.authz.authorize(caller, "versions:read")
         try:
-            return comp.config.version_info(version, include_payload=payload)
+            info = comp.config.version_info(version, include_payload=payload)
         except VersionNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+        if not full_access(caller, "versions:read"):
+            grants = caller.grants("versions:read")
+            info["summary"] = filter_summary(info.get("summary"), grants)
+            if "bundle" in info:
+                info["bundle"] = filter_bundle_dict(info["bundle"], grants)
+        return info
 
-    @app.post(
-        "/v1/config/rollback/preview",
-        dependencies=[Depends(admin_guard)],
-    )
-    async def preview_rollback(req: RollbackRequest):
+    @app.post("/v1/config/rollback/preview")
+    async def preview_rollback(
+        req: RollbackRequest, caller: Caller = Depends(authenticated)
+    ):
+        # A rollback rewrites the full global state: global scope required.
+        comp.authz.authorize(caller, "config:write", [Scope()])
         try:
             result = comp.config.preview_rollback(req.version)
         except VersionNotFound as exc:
@@ -388,8 +703,11 @@ def create_app(components: Components) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc))
         return render_preview(result)
 
-    @app.post("/v1/config/rollback", dependencies=[Depends(admin_guard)])
-    async def post_rollback(req: RollbackRequest):
+    @app.post("/v1/config/rollback")
+    async def post_rollback(
+        req: RollbackRequest, caller: Caller = Depends(authenticated)
+    ):
+        comp.authz.authorize(caller, "config:write", [Scope()])
         try:
             result = comp.config.rollback(
                 req.version,
@@ -418,20 +736,79 @@ def create_app(components: Components) -> FastAPI:
             "summary": result["summary"],
         }
 
-    @app.get("/v1/audit", dependencies=[Depends(admin_guard)])
+    @app.get("/v1/audit")
     async def get_audit(
         type: Optional[str] = Query(default=None),
         limit: int = Query(default=200, ge=1, le=1000),
         since: Optional[float] = None,
+        caller: Caller = Depends(authenticated),
     ):
-        return {"records": comp.audit.query(type_=type, limit=limit, since=since)}
+        comp.authz.authorize(caller, "audit:read")
+        records = comp.audit.query(type_=type, limit=limit, since=since)
+        if not full_access(caller, "audit:read"):
+            grants = caller.grants("audit:read")
+            records = [r for r in records if audit_visible(caller, grants, r)]
+        return {"records": records}
 
-    @app.get("/v1/health/targets", dependencies=[Depends(admin_guard)])
-    async def get_health():
-        return {"targets": comp.health.snapshot()}
+    @app.get("/v1/health/targets")
+    async def get_health(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "health:read")
+        view = comp.health.snapshot()
+        if not full_access(caller, "health:read"):
+            grants = caller.grants("health:read")
+            snap = comp.config.snapshot()
+            visible_ids = {
+                t.id
+                for item in (*snap.all_rules(), *snap.all_release_groups())
+                if covered_by(grants, item)
+                for t in item.targets
+            }
+            view = {tid: st for tid, st in view.items() if tid in visible_ids}
+        return {"targets": view}
 
-    @app.get("/v1/cache", dependencies=[Depends(admin_guard)])
-    async def get_cache():
+    @app.post("/v1/health/targets/{target_id}")
+    async def override_health(
+        target_id: str,
+        req: HealthOverrideRequest,
+        caller: Caller = Depends(authenticated),
+    ):
+        # The override is allowed only when every rule/group referencing the
+        # target is inside the caller's scope; otherwise the write would
+        # leak side effects into someone else's configuration.
+        snap = comp.config.snapshot()
+        refs = [
+            item
+            for item in (*snap.all_rules(), *snap.all_release_groups())
+            if any(t.id == target_id for t in item.targets)
+        ]
+        if not refs:
+            raise HTTPException(
+                status_code=404, detail=f"unknown target {target_id!r}"
+            )
+        comp.authz.authorize(
+            caller, "health:write", [item_scope(i) for i in refs]
+        )
+        old = comp.health.is_healthy(target_id)
+        comp.health.set(target_id, req.healthy)
+        comp.audit.record(
+            "health_change",
+            {
+                "target_id": target_id,
+                "old": old,
+                "new": req.healthy,
+                "source": "admin",
+                "identity": caller.identity_id,
+            },
+        )
+        return {"target_id": target_id, "healthy": req.healthy}
+
+    @app.get("/v1/cache")
+    async def get_cache(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "cache:read")
+        entries = comp.cache.items()
+        if not full_access(caller, "cache:read"):
+            visible = entry_predicate(caller.grants("cache:read"))
+            entries = [e for e in entries if visible(e)]
         return {
             "entries": [
                 {
@@ -446,19 +823,250 @@ def create_app(components: Components) -> FastAPI:
                     "expires_at": e.expires_at,
                     "config_version": e.config_version,
                 }
-                for e in comp.cache.items()
+                for e in entries
             ]
         }
 
-    @app.post("/v1/cache/flush", dependencies=[Depends(admin_guard)])
-    async def flush_cache():
-        n = comp.cache.clear()
+    @app.post("/v1/cache/flush")
+    async def flush_cache(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "cache:flush")
+        if full_access(caller, "cache:flush"):
+            n = comp.cache.clear()
+            flushed_scope = "global"
+        else:
+            n = comp.cache.clear_where(
+                entry_predicate(caller.grants("cache:flush"))
+            )
+            flushed_scope = [
+                g.describe() for g in caller.grants("cache:flush")
+            ]
         comp.audit.record(
             "cache_invalidation",
             {"reason": "manual_flush", "entries": n,
+             "identity": caller.identity_id,
+             "flush_scope": flushed_scope,
              "config_version": comp.config.snapshot().version},
         )
         return {"flushed": n}
+
+    # -- admin delegation ----------------------------------------------------
+
+    @app.post("/v1/admin/roles", status_code=201)
+    async def create_role(
+        req: RoleCreateRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        comp.authz.authorize(caller, "admin:manage")
+
+        def produce():
+            role = comp.authz.create_role(
+                caller, req.id, req.description, req.permissions
+            )
+            return 201, {
+                "role": role.public(),
+                "authz_version": comp.authz.version,
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.get("/v1/admin/roles")
+    async def list_roles(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "admin:manage")
+        return {
+            "roles": [r.public() for r in comp.authz.list_roles(caller)],
+            "authz_version": comp.authz.version,
+        }
+
+    @app.get("/v1/admin/roles/{role_id}")
+    async def get_role(role_id: str, caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "admin:manage")
+        role = comp.authz.get_role(role_id)
+        comp.authz.check_visible(caller, role.permissions)
+        return {"role": role.public(), "authz_version": comp.authz.version}
+
+    @app.put("/v1/admin/roles/{role_id}")
+    async def update_role(
+        role_id: str,
+        req: RoleUpdateRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        comp.authz.authorize(caller, "admin:manage")
+
+        def produce():
+            role = comp.authz.update_role(
+                caller,
+                role_id,
+                req.description,
+                req.permissions,
+                req.expected_version,
+            )
+            return 200, {
+                "role": role.public(),
+                "authz_version": comp.authz.version,
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.delete("/v1/admin/roles/{role_id}")
+    async def delete_role(
+        role_id: str,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        comp.authz.authorize(caller, "admin:manage")
+
+        def produce():
+            comp.authz.delete_role(caller, role_id)
+            return 200, {
+                "deleted": role_id,
+                "authz_version": comp.authz.version,
+            }
+
+        return run_idempotent(idempotency_key, request, caller, {}, produce)
+
+    @app.post("/v1/admin/identities", status_code=201)
+    async def create_identity(
+        req: IdentityCreateRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        comp.authz.authorize(caller, "admin:manage")
+
+        def produce():
+            ident, token = comp.authz.create_identity(
+                caller, req.id, req.roles, token=req.token
+            )
+            # The plaintext token is returned exactly once, here.
+            return 201, {
+                "identity": ident.public(),
+                "token": token,
+                "authz_version": comp.authz.version,
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.get("/v1/admin/identities")
+    async def list_identities(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "admin:manage")
+        return {
+            "identities": [
+                i.public() for i in comp.authz.list_identities(caller)
+            ],
+            "authz_version": comp.authz.version,
+        }
+
+    @app.get("/v1/admin/identities/{identity_id}")
+    async def get_identity(
+        identity_id: str, caller: Caller = Depends(authenticated)
+    ):
+        comp.authz.authorize(caller, "admin:manage")
+        ident = comp.authz.get_identity(identity_id)
+        if not comp.authz.identity_visible(caller, ident):
+            raise Forbidden(
+                f"identity {caller.identity_id!r} may not view "
+                f"identity {identity_id!r}"
+            )
+        return {
+            "identity": ident.public(),
+            "authz_version": comp.authz.version,
+        }
+
+    @app.put("/v1/admin/identities/{identity_id}")
+    async def update_identity(
+        identity_id: str,
+        req: IdentityUpdateRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        comp.authz.authorize(caller, "admin:manage")
+
+        def produce():
+            ident, new_token = comp.authz.update_identity(
+                caller,
+                identity_id,
+                req.roles,
+                req.rotate_token,
+                req.expected_version,
+            )
+            out = {
+                "identity": ident.public(),
+                "authz_version": comp.authz.version,
+            }
+            if new_token is not None:
+                out["token"] = new_token
+            return 200, out
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    def _set_identity_status(
+        identity_id: str,
+        active: bool,
+        request: Request,
+        caller: Caller,
+        idempotency_key: Optional[str],
+    ):
+        comp.authz.authorize(caller, "admin:manage")
+
+        def produce():
+            ident, changed = comp.authz.set_status(caller, identity_id, active)
+            return 200, {
+                "identity": ident.public(),
+                "changed": changed,
+                "authz_version": comp.authz.version,
+            }
+
+        return run_idempotent(idempotency_key, request, caller, {}, produce)
+
+    @app.post("/v1/admin/identities/{identity_id}/deactivate")
+    async def deactivate_identity(
+        identity_id: str,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        return _set_identity_status(
+            identity_id, False, request, caller, idempotency_key
+        )
+
+    @app.post("/v1/admin/identities/{identity_id}/reactivate")
+    async def reactivate_identity(
+        identity_id: str,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        return _set_identity_status(
+            identity_id, True, request, caller, idempotency_key
+        )
 
     return app
 

@@ -129,6 +129,71 @@
 - 客户端可带 `expected_version` 做乐观并发控制：仅当当前版本等于该值时才提交，否则
   **409**，从而保证并发提交不会覆盖较新的版本。
 
+## 多租户管理员委托与作用域授权
+
+控制面支持多套管理员身份：每个身份（identity）持有自己的 Bearer 令牌并挂载若干角色
+（role），角色是 `(action, scope)` 权限的集合。身份、角色、令牌哈希、幂等键与授权版本
+全部落 SQLite 持久化，重启后继续有效。
+
+### 作用域链与继承
+
+授权作用域与规则作用域同构，形成委托链 **global ⊇ region(r) ⊇ tenant(t)**：
+
+- **global** 授权覆盖一切资源；
+- **region(r)** 授权覆盖本区域资源，并**继承**全部租户级资源（租户规则本身与区域无关，
+  因此租户管理经区域管理员委托下放）；
+- **tenant(t)** 授权只覆盖本租户，是链的叶子——**禁止把租户权限扩大到区域或全局**。
+
+委托约束：`admin:manage` 调用者只能创建/修改/指派**自己授权作用域完全覆盖**的角色与身份
+（新旧权限集合都受检），因此租户管理员不可能为自己或他人铸造区域/全局权限，越权委托
+返回 **403**。
+
+### 动作与控制面授权
+
+动作集合：`config:read`、`config:write`、`versions:read`、`cache:read`、`cache:flush`、
+`health:read`、`health:write`、`audit:read`、`admin:manage`。每个控制面请求先认证
+（失败 **401**），再按动作与资源作用域授权（越权 **403**，且授权在任何变更之前完成，
+**被拒绝的请求不会产生配置或缓存副作用**）。允许与拒绝都写入审计
+（`authz_decision` / `authz_denied`）。
+
+- `POST /v1/config`（含 preview）：全局调用者照旧全量应用；作用域调用者提交的 bundle 里
+  **每一项都必须被其作用域覆盖**（否则 403），随后按**作用域合并**应用——只替换自己
+  作用域内的规则/发布组/限流档位，域外项（含定时规则）原样保留，`defaults` 仅全局
+  调用者可改。版本号仍在全局单调递增，`expected_version`/`preview_token` 语义不变。
+- `GET /v1/config`、`GET /v1/cache`、`GET /v1/health/targets`：按调用者作用域过滤输出。
+- `POST /v1/cache/flush`：只清调用者作用域内的缓存项（区域授权清本区域答案，租户授权
+  清本租户答案，全局清全部），审计记录清理作用域。
+- `POST /v1/health/targets/{id}`（`{"healthy": bool}`）：手工健康覆盖。仅当**所有**引用
+  该目标的规则/发布组都在调用者作用域内时允许（否则 403，无副作用），写 `health_change`
+  审计（含操作身份）。
+- `GET /v1/config/versions*`：版本摘要的差异与 payload 按 `versions:read` 作用域过滤。
+- 回滚会重写全局状态，因此仅 **global** 作用域的 `config:write` 可用。
+- `GET /v1/audit`：全局调用者看全部；作用域调用者看到与自身相关的记录及其作用域覆盖的
+  记录。
+
+### 身份生命周期、版本与幂等
+
+- 创建身份时返回一次明文令牌（只存 SHA-256 哈希，之后任何接口不再回显）；
+  `PUT /v1/admin/identities/{id}` 可整体替换角色或 `rotate_token` 轮换令牌——
+  **旧令牌立即失效**（下一次请求即 401）；`POST .../deactivate` 停用**立即生效**，
+  `.../reactivate` 恢复。
+- 每次角色/身份变更使全局 `authz_version` 单调递增并提升实体的
+  `role_version`/`identity_version`；更新可带 `expected_version` 做乐观并发（冲突 409），
+  并发提交由锁串行化、唯一约束兜底。
+- 所有管理写接口接受 `Idempotency-Key` 头：首个响应被持久化，相同键的重复提交**重放**
+  原响应（`idempotent_replay: true`，不重复递增版本、不重复写审计）；同键不同载荷
+  返回 **409**。停用/启用本身也是天然幂等的（重复调用返回 `changed: false`，不产生
+  额外版本或审计）。
+- 角色仍被身份引用时不可删除（409）；所有身份/角色变更写 `identity_change` /
+  `role_change` 审计（含操作者与 `authz_version`）。
+
+### 认证模式与兼容
+
+- 设置了 `GEORESOLVE_ADMIN_TOKEN`：该令牌作为内置全局 **bootstrap** 调用者，既有部署
+  行为不变；身份令牌与 bootstrap 令牌可同时使用。
+- 未设置令牌且没有任何身份：控制面保持开放（开发模式）；**一旦创建第一个身份即强制
+  认证**，匿名请求得到 401。
+
 ## API
 
 数据面（无需认证）：
@@ -139,20 +204,35 @@
 | `GET /v1/explain?name=&region=&tenant=&client=&labels=` | 查询当前采用的规则版本、目标、生效时间、灰度命中与原因、限流档位/剩余额度/拒绝原因、缓存状态、下次切换时间；不消耗限流令牌 |
 | `GET /healthz` | 存活探针 |
 
-控制面（设置 `GEORESOLVE_ADMIN_TOKEN` 后需 `Authorization: Bearer <token>`）：
+控制面（需认证：`Authorization: Bearer <token>`，令牌为身份令牌或
+`GEORESOLVE_ADMIN_TOKEN`；所有请求按调用者身份与作用域授权，越权返回 403 且无副作用）：
 
 | 接口 | 说明 |
 |---|---|
-| `GET /v1/config` | 当前配置快照（版本、默认值、全部规则含定时版本、全部发布组、全部限流档位） |
-| `POST /v1/config` | 应用新配置 bundle（版本必须递增）；可带 `expected_version` 做乐观并发校验，可带 `preview_token` 只提交预演过的内容 |
+| `GET /v1/config` | 当前配置快照，按 `config:read` 作用域过滤（版本、默认值、规则含定时版本、发布组、限流档位） |
+| `POST /v1/config` | 应用新配置 bundle（版本必须递增）；作用域调用者按作用域合并应用；可带 `expected_version` 做乐观并发校验，可带 `preview_token` 只提交预演过的内容 |
 | `POST /v1/config/preview` | 配置预演：跑完整校验/合并/差异/影响计算（规则、灰度组、缓存失效、限流桶），**不改变生效配置、缓存、限流桶或审计**，返回一次性、有时效的 `preview_token` |
-| `GET /v1/config/versions?limit=` | 已保存版本列表与摘要（受影响名字、规则/发布组/限流档位差异、影响） |
-| `GET /v1/config/versions/{v}?payload=true` | 单个已保存版本：摘要、差异与完整 bundle |
-| `POST /v1/config/rollback` | 回滚到已保存版本：以其内容生成**更高的新版本**，走与普通应用相同的校验、缓存失效、桶重置与审计流程；可带 `expected_version`/`preview_token` |
-| `POST /v1/config/rollback/preview` | 回滚预演（不落任何变更） |
-| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback` |
-| `GET /v1/health/targets` | 目标健康视图 |
-| `GET /v1/cache` / `POST /v1/cache/flush` | 缓存查看 / 清空（清空会记审计） |
+| `GET /v1/config/versions?limit=` | 已保存版本列表与摘要，差异按 `versions:read` 作用域过滤 |
+| `GET /v1/config/versions/{v}?payload=true` | 单个已保存版本：摘要、差异与（按作用域过滤的）bundle |
+| `POST /v1/config/rollback` | 回滚到已保存版本：以其内容生成**更高的新版本**，走与普通应用相同的校验、缓存失效、桶重置与审计流程；可带 `expected_version`/`preview_token`；仅全局作用域 |
+| `POST /v1/config/rollback/preview` | 回滚预演（不落任何变更）；仅全局作用域 |
+| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback`、`authz_decision`、`authz_denied`、`identity_change`、`role_change`；按 `audit:read` 作用域过滤 |
+| `GET /v1/health/targets` | 目标健康视图，按 `health:read` 作用域过滤 |
+| `POST /v1/health/targets/{id}` | 手工健康覆盖（`{"healthy": bool}`）；要求目标的所有引用都在调用者 `health:write` 作用域内；写审计 |
+| `GET /v1/cache` / `POST /v1/cache/flush` | 缓存查看（按 `cache:read` 过滤）/ 按 `cache:flush` 作用域清空（清空会记审计） |
+
+管理委托（需 `admin:manage`，写接口支持 `Idempotency-Key` 幂等重试）：
+
+| 接口 | 说明 |
+|---|---|
+| `POST /v1/admin/roles` | 创建角色（权限作用域必须被调用者覆盖，否则 403） |
+| `GET /v1/admin/roles` / `GET /v1/admin/roles/{id}` | 列出/查看角色（按委托可见性过滤） |
+| `PUT /v1/admin/roles/{id}` | 更新角色权限/描述（`role_version` 递增，可带 `expected_version`） |
+| `DELETE /v1/admin/roles/{id}` | 删除角色（仍被引用时 409） |
+| `POST /v1/admin/identities` | 创建身份，明文令牌仅此一次返回 |
+| `GET /v1/admin/identities` / `GET /v1/admin/identities/{id}` | 列出/查看身份（不含令牌哈希） |
+| `PUT /v1/admin/identities/{id}` | 替换角色 / `rotate_token` 轮换令牌（旧令牌立即失效） |
+| `POST /v1/admin/identities/{id}/deactivate` / `.../reactivate` | 停用（立即生效）/ 恢复；天然幂等 |
 
 ### 配置示例
 
@@ -236,7 +316,7 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-107 个用例覆盖：三层覆盖与跨租户/区域隔离、加权选择的确定性与分布、正/负缓存与
+150+ 个用例覆盖：三层覆盖与跨租户/区域隔离、加权选择的确定性与分布、正/负缓存与
 TTL、版本单调性与选择性失效、定时规则激活、健康切换的确定顺序与恢复收敛、
 健康检查阈值、灰度发布组（标签匹配、时间窗口、百分比确定性、优先级、缓存隔离
 与失效、explain 与审计、非法配置拒绝）、租户/标签限流（层级选择、优先级、
@@ -245,7 +325,12 @@ explain 余量、桶替换重置与审计、非法配置拒绝）、配置变更
 状态、预演影响与实际失效一致、预演令牌的过期/单次/过时基线/内容篡改/种类不匹配
 拒绝、版本历史与差异查询、回滚生成更高新版本并走完整校验/缓存/审计管线、回滚到
 不存在/当前/同内容版本被拒、乐观并发与同版本号并发提交不覆盖）、
-API 全流程（含 400/401/404/409/410/422/429）。
+多租户管理员委托与作用域授权（身份生命周期与立即停用/令牌轮换、
+global→region→tenant 作用域继承、作用域合并应用与定时规则保留、越权 403 且
+无配置/缓存副作用、缓存清理与健康覆盖的作用域限制、版本历史与审计的作用域过滤、
+禁止租户权限扩大到区域/全局、乐观并发与并发修改、幂等键重放与冲突、
+授权决定/拒绝/身份变更审计、重启后持久化）、
+API 全流程（含 400/401/403/404/409/410/422/429）。
 
 ## 设计说明与边界
 

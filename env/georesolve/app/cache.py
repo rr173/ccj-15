@@ -98,3 +98,11 @@ class ResolutionCache:
             n = len(self._entries)
             self._entries.clear()
             return n
+
+    def clear_where(self, predicate: Callable[[CacheEntry], bool]) -> int:
+        """Drop only the entries matching ``predicate`` (scoped flush)."""
+        with self._lock:
+            keys = [k for k, e in self._entries.items() if predicate(e)]
+            for k in keys:
+                del self._entries[k]
+            return len(keys)

@@ -654,6 +654,8 @@ class ConfigManager:
                     "name": name,
                     "group_id": group.id if group else None,
                     "scope": group.scope if group else None,
+                    "region": group.region if group else None,
+                    "tenant": group.tenant if group else None,
                     "priority": group.priority if group else None,
                     "percent": group.percent if group else None,
                     "match_labels": dict(group.match_labels) if group else None,
