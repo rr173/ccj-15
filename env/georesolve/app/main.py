@@ -47,6 +47,19 @@ or global permissions):
   POST   /v1/admin/identities/{id}/deactivate - revoke access immediately
   POST   /v1/admin/identities/{id}/reactivate - restore access
 
+Emergency grants (temporary, approval-gated permission elevation; while
+approved and unexpired the grant's permissions join the identity's own on
+every control-plane request, and expiry/revocation take effect immediately):
+  POST   /v1/admin/emergency-grants             - request a grant (reason,
+                                                  permissions, duration)
+  GET    /v1/admin/emergency-grants             - list visible grants
+  GET    /v1/admin/emergency-grants/{id}        - one grant
+  POST   /v1/admin/emergency-grants/{id}/approve - approve (admin:manage
+                                                  covering the grant; never
+                                                  one's own request)
+  POST   /v1/admin/emergency-grants/{id}/reject  - reject a pending request
+  POST   /v1/admin/emergency-grants/{id}/revoke  - revoke an active grant
+
 All admin mutations accept an `Idempotency-Key` header: the first response
 is persisted and replayed for duplicate submissions (no duplicate version
 bumps or audit records); reusing the key with a different payload is a 409.
@@ -65,11 +78,12 @@ from typing import Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from . import __version__
 from .audit import AuditLog
 from .authz import (
+    GRANT_STATUSES,
     AuthnError,
     AuthzConflict,
     AuthzNotFound,
@@ -151,6 +165,33 @@ class IdentityUpdateRequest(BaseModel):
 
 class HealthOverrideRequest(BaseModel):
     healthy: bool
+
+
+class EmergencyGrantCreateRequest(BaseModel):
+    identity_id: str = Field(description="identity the grant elevates")
+    reason: str = Field(min_length=1, description="why the elevation is needed")
+    permissions: list[Permission] = Field(min_length=1)
+    duration_seconds: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="validity window, started at approval time",
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("reason must be a non-empty string")
+        return v
+
+
+class EmergencyGrantDecideRequest(BaseModel):
+    comment: Optional[str] = None
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
+class EmergencyGrantRevokeRequest(BaseModel):
+    expected_version: Optional[int] = Field(default=None, ge=1)
 
 
 class Components:
@@ -453,6 +494,7 @@ def create_app(components: Components) -> FastAPI:
         if caller.kind == "identity" and caller.identity_id in (
             details.get("identity"),
             details.get("actor"),
+            details.get("requested_by"),
         ):
             return True
         scope = record_scope(details)
@@ -1066,6 +1108,146 @@ def create_app(components: Components) -> FastAPI:
     ):
         return _set_identity_status(
             identity_id, True, request, caller, idempotency_key
+        )
+
+    # -- emergency grants --------------------------------------------------
+
+    @app.post("/v1/admin/emergency-grants", status_code=201)
+    async def create_emergency_grant(
+        req: EmergencyGrantCreateRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        # Any authenticated caller may file a request; it grants nothing
+        # until a different, authorized admin approves it.
+        def produce():
+            grant = comp.authz.request_grant(
+                caller,
+                req.identity_id,
+                req.reason,
+                req.permissions,
+                req.duration_seconds,
+            )
+            return 201, {
+                "grant": comp.authz.grant_view(grant),
+                "authz_version": comp.authz.version,
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.get("/v1/admin/emergency-grants")
+    async def list_emergency_grants(
+        status: Optional[str] = Query(default=None),
+        identity_id: Optional[str] = Query(default=None),
+        caller: Caller = Depends(authenticated),
+    ):
+        if status is not None and status not in GRANT_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown status {status!r}; "
+                f"known: {sorted(GRANT_STATUSES)}",
+            )
+        grants = comp.authz.list_grants(caller, status=status, identity_id=identity_id)
+        return {
+            "grants": [comp.authz.grant_view(g) for g in grants],
+            "authz_version": comp.authz.version,
+        }
+
+    @app.get("/v1/admin/emergency-grants/{grant_id}")
+    async def get_emergency_grant(
+        grant_id: str, caller: Caller = Depends(authenticated)
+    ):
+        grant = comp.authz.get_grant(grant_id)
+        if not comp.authz.grant_visible(caller, grant):
+            raise Forbidden(
+                f"identity {caller.identity_id!r} may not view "
+                f"emergency grant {grant_id!r}"
+            )
+        return {
+            "grant": comp.authz.grant_view(grant),
+            "authz_version": comp.authz.version,
+        }
+
+    def _decide_emergency_grant(
+        grant_id: str,
+        approve: bool,
+        req: EmergencyGrantDecideRequest,
+        request: Request,
+        caller: Caller,
+        idempotency_key: Optional[str],
+    ):
+        # Deciding requires admin:manage; the store additionally enforces
+        # that the decider is not the requester and that the granted
+        # permissions stay within the decider's delegable scope.
+        comp.authz.authorize(caller, "admin:manage")
+
+        def produce():
+            grant = comp.authz.decide_grant(
+                caller, grant_id, approve, req.comment, req.expected_version
+            )
+            return 200, {
+                "grant": comp.authz.grant_view(grant),
+                "authz_version": comp.authz.version,
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.post("/v1/admin/emergency-grants/{grant_id}/approve")
+    async def approve_emergency_grant(
+        grant_id: str,
+        req: EmergencyGrantDecideRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        return _decide_emergency_grant(
+            grant_id, True, req, request, caller, idempotency_key
+        )
+
+    @app.post("/v1/admin/emergency-grants/{grant_id}/reject")
+    async def reject_emergency_grant(
+        grant_id: str,
+        req: EmergencyGrantDecideRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        return _decide_emergency_grant(
+            grant_id, False, req, request, caller, idempotency_key
+        )
+
+    @app.post("/v1/admin/emergency-grants/{grant_id}/revoke")
+    async def revoke_emergency_grant(
+        grant_id: str,
+        req: EmergencyGrantRevokeRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        # The grantee, the requester or an admin:manage holder covering the
+        # grant's scopes may revoke; the store performs and audits the check.
+        def produce():
+            grant = comp.authz.revoke_grant(caller, grant_id, req.expected_version)
+            return 200, {
+                "grant": comp.authz.grant_view(grant),
+                "authz_version": comp.authz.version,
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
         )
 
     return app

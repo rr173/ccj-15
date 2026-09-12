@@ -187,6 +187,36 @@
 - 角色仍被身份引用时不可删除（409）；所有身份/角色变更写 `identity_change` /
   `role_change` 审计（含操作者与 `authz_version`）。
 
+### 临时应急授权（emergency grants）
+
+应急授权是一个身份的**临时权限提升**，走"申请 → 审批 → 生效 → 到期/撤销"流程：
+
+- **申请**：任何已认证身份都可以为自己或另一个身份提交
+  `POST /v1/admin/emergency-grants`，携带原因 `reason`、权限集合 `permissions`
+  （与角色相同的 `(action, scope)` 形式）、有效时长 `duration_seconds`。
+  申请本身不授予任何权限，`pending` 状态的授权不参与权限计算。
+- **审批**：另一名持有 `admin:manage` 的管理员调用 `.../approve` 或 `.../reject`。
+  **审批人不能审批自己的申请**（403）；被批准的权限必须完全落在审批人
+  `admin:manage` 的**可委托范围**内（否则 403）——租户管理员无法批准区域/全局的
+  提权。有效期从**批准时刻**起算（`expires_at = approved_at + duration_seconds`）。
+- **生效**：授权在`approved` 且未到期时，于**每一次控制面请求**并入该身份的权限
+  计算——配置读写、缓存清理、健康操作、版本查询等全部按授权的作用域执行，
+  与角色权限完全同构；授权决定审计（`authz_decision`）会带上生效中的授权 ID。
+- **失效**：到期与撤销都**立即生效**——权限按请求实时计算、从不烘进令牌，因此
+  过期或被撤销后，同一令牌的下一次请求即失去该权限（403）。过期采用惰性判定：
+  任何请求或查询首次发现过期时完成状态迁移、持久化并写审计。
+- **状态机**：`pending → approved / rejected`，`approved → revoked / expired`。
+  终态不可再写：重复审批、审批已拒绝的授权、撤销未生效或**已过期**的授权都返回
+  **409**；并发审批/撤销由锁串行化，只有一个成功，其余 409。`approve`/`reject`/
+  `revoke` 支持 `expected_version` 乐观并发。
+- **持久化与审计**：`requested` / `approved` / `rejected` / `revoked` / `expired`
+  全部落 SQLite（重启后状态继续有效）并写 `emergency_grant` 审计（含申请人、
+  审批人、原因、权限、作用域、到期时间与 `authz_version`）；四个写接口都支持
+  `Idempotency-Key` 幂等重放。
+- **可见性**：申请人、受权身份本人、以及 `admin:manage` 覆盖该授权作用域的管理员
+  可以在 `GET /v1/admin/emergency-grants*` 看到授权；撤销可以由受权身份、申请人
+  或覆盖作用域的管理员发起。
+
 ### 认证模式与兼容
 
 - 设置了 `GEORESOLVE_ADMIN_TOKEN`：该令牌作为内置全局 **bootstrap** 调用者，既有部署
@@ -216,7 +246,7 @@
 | `GET /v1/config/versions/{v}?payload=true` | 单个已保存版本：摘要、差异与（按作用域过滤的）bundle |
 | `POST /v1/config/rollback` | 回滚到已保存版本：以其内容生成**更高的新版本**，走与普通应用相同的校验、缓存失效、桶重置与审计流程；可带 `expected_version`/`preview_token`；仅全局作用域 |
 | `POST /v1/config/rollback/preview` | 回滚预演（不落任何变更）；仅全局作用域 |
-| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback`、`authz_decision`、`authz_denied`、`identity_change`、`role_change`；按 `audit:read` 作用域过滤 |
+| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback`、`authz_decision`、`authz_denied`、`identity_change`、`role_change`、`emergency_grant`；按 `audit:read` 作用域过滤 |
 | `GET /v1/health/targets` | 目标健康视图，按 `health:read` 作用域过滤 |
 | `POST /v1/health/targets/{id}` | 手工健康覆盖（`{"healthy": bool}`）；要求目标的所有引用都在调用者 `health:write` 作用域内；写审计 |
 | `GET /v1/cache` / `POST /v1/cache/flush` | 缓存查看（按 `cache:read` 过滤）/ 按 `cache:flush` 作用域清空（清空会记审计） |
@@ -233,6 +263,16 @@
 | `GET /v1/admin/identities` / `GET /v1/admin/identities/{id}` | 列出/查看身份（不含令牌哈希） |
 | `PUT /v1/admin/identities/{id}` | 替换角色 / `rotate_token` 轮换令牌（旧令牌立即失效） |
 | `POST /v1/admin/identities/{id}/deactivate` / `.../reactivate` | 停用（立即生效）/ 恢复；天然幂等 |
+
+临时应急授权（申请 → 审批 → 生效 → 到期/撤销；写接口支持 `Idempotency-Key`）：
+
+| 接口 | 说明 |
+|---|---|
+| `POST /v1/admin/emergency-grants` | 申请应急授权（`identity_id`、`reason`、`permissions`、`duration_seconds`）；任何已认证身份可申请，201 返回 `pending` 授权 |
+| `GET /v1/admin/emergency-grants?status=&identity_id=` | 列出可见的授权（申请人/受权人/可委托管理员可见） |
+| `GET /v1/admin/emergency-grants/{id}` | 查看单个授权（含 `active`、`remaining_seconds`） |
+| `POST /v1/admin/emergency-grants/{id}/approve` / `.../reject` | 审批/拒绝：需 `admin:manage` 且授权权限不超出审批人可委托范围；不能审批自己的申请（403）；非 `pending` 状态返回 409；可带 `expected_version` |
+| `POST /v1/admin/emergency-grants/{id}/revoke` | 撤销生效中的授权（受权人/申请人/可委托管理员）；立即失效；未生效或已过期返回 409 |
 
 ### 配置示例
 
@@ -330,6 +370,10 @@ global→region→tenant 作用域继承、作用域合并应用与定时规则�
 无配置/缓存副作用、缓存清理与健康覆盖的作用域限制、版本历史与审计的作用域过滤、
 禁止租户权限扩大到区域/全局、乐观并发与并发修改、幂等键重放与冲突、
 授权决定/拒绝/身份变更审计、重启后持久化）、
+临时应急授权（申请-审批-生效-到期/撤销全流程、审批前不生效、审批人不能批自己的
+申请、授权范围不超出审批人可委托范围、生效授权逐请求参与配置/缓存/健康/版本
+计算、到期与撤销立即失效且旧令牌不可继续用、终态与过期状态写入 409、并发审批
+唯一成功、幂等重放、全事件持久化与审计、重启后状态与到期语义保持）、
 API 全流程（含 400/401/403/404/409/410/422/429）。
 
 ## 设计说明与边界

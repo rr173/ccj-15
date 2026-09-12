@@ -28,6 +28,21 @@ Enforcement model:
   for duplicate submissions, while the same key with a different payload is
   rejected with a conflict).
 
+Emergency grants: an identity (or an admin on its behalf) can request a
+*temporary* permission elevation carrying a reason, a permission set and a
+validity duration. The request is inert until a *different* caller holding
+``admin:manage`` over the requested scopes approves it (approvers can never
+rule on their own requests, and the granted permissions may not exceed the
+approver's delegable scope). While approved and unexpired, the grant's
+permissions are folded into the identity's permission set on *every*
+control-plane request, so config, cache, health and version endpoints all
+execute against the grant's scopes. Expiry (lazy, audited and persisted the
+moment it is noticed) and revocation take effect immediately: permissions
+are recomputed per request, never cached in tokens, so an old token cannot
+keep using a lapsed grant. Every transition (requested, approved, rejected,
+revoked, expired) is persisted and audited, and writes against terminal or
+expired states are rejected with a conflict.
+
 Legacy interop: the static ``GEORESOLVE_ADMIN_TOKEN`` (when set) acts as a
 built-in global "bootstrap" caller so existing deployments keep working;
 when no token is configured and no identities exist yet, the control plane
@@ -38,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import secrets
 import sqlite3
 import threading
@@ -206,6 +222,88 @@ def generate_token() -> str:
     return "grz_" + secrets.token_urlsafe(24)
 
 
+# -- emergency grants ---------------------------------------------------------
+
+#: Lifecycle states of an emergency grant.
+GRANT_STATUSES = frozenset({"pending", "approved", "rejected", "revoked", "expired"})
+
+#: States no transition may leave.
+GRANT_TERMINAL_STATUSES = frozenset({"rejected", "revoked", "expired"})
+
+
+class EmergencyGrant(BaseModel):
+    """A temporary, approval-gated permission elevation for one identity.
+
+    Lifecycle: ``pending`` -> ``approved`` -> ``expired`` | ``revoked``, or
+    ``pending`` -> ``rejected``. Only an approved grant inside its validity
+    window participates in permission computation; the window starts at
+    approval time (``expires_at = approved_at + duration_seconds``), so the
+    effective lifetime never depends on how long approval took.
+    """
+
+    id: str
+    identity_id: str  # grantee: the identity the permissions apply to
+    reason: str
+    permissions: list[Permission] = Field(min_length=1)
+    duration_seconds: float = Field(gt=0)
+    status: str = "pending"
+    requested_by: str = ""
+    requested_at: float = 0.0
+    decided_by: Optional[str] = None
+    decided_at: Optional[float] = None
+    decision_comment: Optional[str] = None
+    approved_at: Optional[float] = None
+    expires_at: Optional[float] = None
+    revoked_by: Optional[str] = None
+    revoked_at: Optional[float] = None
+    grant_version: int = 1
+    updated_at: float = 0.0
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_non_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("reason must be a non-empty string")
+        return v
+
+    @field_validator("duration_seconds")
+    @classmethod
+    def _duration_finite_positive(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("duration_seconds must be a finite positive number")
+        return v
+
+    @field_validator("status")
+    @classmethod
+    def _known_status(cls, v: str) -> str:
+        if v not in GRANT_STATUSES:
+            raise ValueError(
+                f"unknown grant status {v!r}; known: {sorted(GRANT_STATUSES)}"
+            )
+        return v
+
+    def is_active(self, now: float) -> bool:
+        """True while the grant's permissions must be computed into callers."""
+        return (
+            self.status == "approved"
+            and self.expires_at is not None
+            and self.expires_at > now
+        )
+
+    def public(self, now: Optional[float] = None) -> dict:
+        out = self.model_dump()
+        out["scopes"] = [p.scope.describe() for p in self.permissions]
+        if now is not None:
+            active = self.is_active(now)
+            out["active"] = active
+            out["remaining_seconds"] = (
+                max(0.0, self.expires_at - now)
+                if active and self.expires_at is not None
+                else 0.0
+            )
+        return out
+
+
 # -- caller ------------------------------------------------------------------
 
 
@@ -216,6 +314,9 @@ class Caller:
     identity_id: str
     kind: str  # "identity" | "bootstrap" | "open"
     permissions: tuple[Permission, ...]
+    #: Ids of the emergency grants contributing permissions right now;
+    #: recorded in authorization-decision audits for traceability.
+    emergency_grants: tuple[str, ...] = ()
 
     @property
     def is_global(self) -> bool:
@@ -257,6 +358,7 @@ class AuthzStore:
         self._lock = threading.RLock()
         self._roles: dict[str, Role] = {}
         self._identities: dict[str, Identity] = {}
+        self._grants: dict[str, EmergencyGrant] = {}
         self._token_index: dict[str, str] = {}  # token hash -> identity id
         self._version = 0
         self._load()
@@ -274,6 +376,9 @@ class AuthzStore:
                 # The index holds every known hash (active or not) so a
                 # deactivated identity is denied with a precise reason.
                 self._token_index[ident.token_hash] = ident.id
+            for row in self._conn.execute("SELECT payload FROM authz_emergency_grants"):
+                grant = EmergencyGrant(**json.loads(row["payload"]))
+                self._grants[grant.id] = grant
             row = self._conn.execute(
                 "SELECT v FROM authz_meta WHERE k = 'authz_version'"
             ).fetchone()
@@ -320,6 +425,26 @@ class AuthzStore:
         )
         self._conn.commit()
 
+    def _persist_grant(self, grant: EmergencyGrant) -> None:
+        self._conn.execute(
+            "INSERT INTO authz_emergency_grants"
+            " (id, identity_id, status, payload, created_at, updated_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET status=excluded.status,"
+            " payload=excluded.payload, updated_at=excluded.updated_at,"
+            " expires_at=excluded.expires_at",
+            (
+                grant.id,
+                grant.identity_id,
+                grant.status,
+                grant.model_dump_json(),
+                grant.requested_at,
+                grant.updated_at,
+                grant.expires_at,
+            ),
+        )
+        self._conn.commit()
+
     def _bump_version(self) -> int:
         self._version += 1
         self._conn.execute(
@@ -358,10 +483,15 @@ class AuthzStore:
                             },
                         )
                         raise AuthnError(f"identity {ident.id!r} is deactivated")
+                    # Lapse overdue grants before computing permissions so an
+                    # expired grant never survives into this request.
+                    self._expire_overdue_grants()
+                    permissions, grant_ids = self._permissions_of(ident)
                     return Caller(
                         identity_id=ident.id,
                         kind="identity",
-                        permissions=tuple(self._permissions_of(ident)),
+                        permissions=tuple(permissions),
+                        emergency_grants=tuple(grant_ids),
                     )
                 if self._admin_token and secrets.compare_digest(
                     token, self._admin_token
@@ -388,13 +518,25 @@ class AuthzStore:
             )
             raise AuthnError("invalid or missing admin token")
 
-    def _permissions_of(self, ident: Identity) -> list[Permission]:
+    def _permissions_of(self, ident: Identity) -> tuple[list[Permission], list[str]]:
+        """Role permissions plus every active emergency grant.
+
+        Permissions are recomputed from live store state on every request --
+        never baked into tokens -- so revocation and expiry of a grant take
+        effect on the very next request made with the same token.
+        """
         perms: list[Permission] = []
         for role_id in ident.roles:
             role = self._roles.get(role_id)
             if role:
                 perms.extend(role.permissions)
-        return perms
+        grant_ids: list[str] = []
+        now = self._clock()
+        for grant in self._grants.values():
+            if grant.identity_id == ident.id and grant.is_active(now):
+                perms.extend(grant.permissions)
+                grant_ids.append(grant.id)
+        return perms, grant_ids
 
     # -- authorization -----------------------------------------------------
 
@@ -450,6 +592,8 @@ class AuthzStore:
             "outcome": outcome,
             "authz_version": self._version,
         }
+        if caller.emergency_grants:
+            details["emergency_grants"] = list(caller.emergency_grants)
         if reason:
             details["reason"] = reason
         self._audit.record(
@@ -811,6 +955,278 @@ class AuthzStore:
     def identity_visible(self, caller: Caller, ident: Identity) -> bool:
         with self._lock:
             return self._identity_visible(caller, ident)
+
+    # -- emergency grants -------------------------------------------------
+
+    def _new_grant_id(self) -> str:
+        while True:
+            grant_id = "egrant_" + secrets.token_urlsafe(9)
+            if grant_id not in self._grants:
+                return grant_id
+
+    def _grant_audit_details(
+        self,
+        action: str,
+        grant: EmergencyGrant,
+        actor: str,
+        version: int,
+        comment: Optional[str] = None,
+    ) -> dict:
+        details = {
+            "action": action,
+            "grant_id": grant.id,
+            "identity": grant.identity_id,
+            "requested_by": grant.requested_by,
+            "actor": actor,
+            "reason": grant.reason,
+            "permissions": [p.model_dump() for p in grant.permissions],
+            "scopes": [p.scope.describe() for p in grant.permissions],
+            "duration_seconds": grant.duration_seconds,
+            "status": grant.status,
+            "grant_version": grant.grant_version,
+            "expires_at": grant.expires_at,
+            "authz_version": version,
+        }
+        if comment:
+            details["comment"] = comment
+        return details
+
+    def _expire_overdue_grants(self) -> None:
+        """Lapse every active grant whose window has closed.
+
+        Expiry is lazy: the transition is detected, persisted and audited the
+        first time anyone looks (authentication, grant reads, decisions),
+        which is also the moment the permissions stop applying.
+        """
+        now = self._clock()
+        for grant in self._grants.values():
+            if (
+                grant.status == "approved"
+                and grant.expires_at is not None
+                and grant.expires_at <= now
+            ):
+                grant.status = "expired"
+                grant.grant_version += 1
+                grant.updated_at = now
+                version = self._bump_version()
+                self._persist_grant(grant)
+                self._audit.record(
+                    "emergency_grant",
+                    self._grant_audit_details("expired", grant, "system", version),
+                )
+
+    def request_grant(
+        self,
+        caller: Caller,
+        identity_id: str,
+        reason: str,
+        permissions: list[Permission],
+        duration_seconds: float,
+    ) -> EmergencyGrant:
+        """File an emergency grant request. The request itself grants nothing.
+
+        Any authenticated caller may request (for itself or another
+        identity); the permission gate is the approval step, where the
+        approver's delegable scope is enforced.
+        """
+        with self._lock:
+            self._expire_overdue_grants()
+            if identity_id not in self._identities:
+                raise AuthzNotFound(f"identity {identity_id!r} does not exist")
+            now = self._clock()
+            grant = EmergencyGrant(
+                id=self._new_grant_id(),
+                identity_id=identity_id,
+                reason=reason,
+                permissions=list(permissions),
+                duration_seconds=duration_seconds,
+                status="pending",
+                requested_by=caller.identity_id,
+                requested_at=now,
+                updated_at=now,
+            )
+            version = self._bump_version()
+            self._grants[grant.id] = grant
+            self._persist_grant(grant)
+            self._audit.record(
+                "emergency_grant",
+                self._grant_audit_details(
+                    "requested", grant, caller.identity_id, version
+                ),
+            )
+            return grant
+
+    def decide_grant(
+        self,
+        caller: Caller,
+        grant_id: str,
+        approve: bool,
+        comment: Optional[str],
+        expected_version: Optional[int],
+    ) -> EmergencyGrant:
+        """Approve or reject a pending request.
+
+        Separation of duties: a caller can never rule on its own request.
+        The granted permissions must be fully covered by the decider's
+        ``admin:manage`` scope, so a narrower admin cannot approve an
+        elevation beyond what it could itself delegate. Only one decision is
+        possible: concurrent deciders are serialized by the lock and the
+        loser sees a conflict, as does anyone deciding an already decided or
+        lapsed grant.
+        """
+        with self._lock:
+            self._expire_overdue_grants()
+            grant = self._grants.get(grant_id)
+            if grant is None:
+                raise AuthzNotFound(f"emergency grant {grant_id!r} does not exist")
+            if caller.kind != "open" and caller.identity_id == grant.requested_by:
+                raise Forbidden(
+                    f"caller {caller.identity_id!r} cannot approve or reject "
+                    "its own emergency grant request"
+                )
+            self._check_delegation(caller, grant.permissions)
+            if grant.status != "pending":
+                raise AuthzConflict(
+                    f"emergency grant {grant_id!r} is already {grant.status}; "
+                    "only a pending request can be decided"
+                )
+            if expected_version is not None and expected_version != grant.grant_version:
+                raise AuthzConflict(
+                    f"optimistic concurrency check failed for emergency grant "
+                    f"{grant_id!r}: expected version {expected_version}, "
+                    f"current {grant.grant_version}"
+                )
+            now = self._clock()
+            grant.status = "approved" if approve else "rejected"
+            grant.decided_by = caller.identity_id
+            grant.decided_at = now
+            grant.decision_comment = comment
+            if approve:
+                grant.approved_at = now
+                grant.expires_at = now + grant.duration_seconds
+            grant.grant_version += 1
+            grant.updated_at = now
+            version = self._bump_version()
+            self._persist_grant(grant)
+            self._audit.record(
+                "emergency_grant",
+                self._grant_audit_details(
+                    "approved" if approve else "rejected",
+                    grant,
+                    caller.identity_id,
+                    version,
+                    comment=comment,
+                ),
+            )
+            return grant
+
+    def _can_revoke(self, caller: Caller, grant: EmergencyGrant) -> bool:
+        if caller.kind in ("bootstrap", "open"):
+            return True
+        # The grantee and the original requester may always give the
+        # elevation up; anyone else needs admin:manage over the scopes.
+        if caller.identity_id in (grant.identity_id, grant.requested_by):
+            return True
+        return self._delegable(caller, grant.permissions)
+
+    def revoke_grant(
+        self,
+        caller: Caller,
+        grant_id: str,
+        expected_version: Optional[int],
+    ) -> EmergencyGrant:
+        """Revoke an active grant; the permissions lapse immediately.
+
+        Revoking a grant that is not currently active -- including one that
+        has already expired -- is a conflict, so concurrent revokers and
+        late writes against a lapsed grant are rejected.
+        """
+        with self._lock:
+            self._expire_overdue_grants()
+            grant = self._grants.get(grant_id)
+            if grant is None:
+                raise AuthzNotFound(f"emergency grant {grant_id!r} does not exist")
+            scopes = [p.scope for p in grant.permissions]
+            if not self._can_revoke(caller, grant):
+                self._record_decision(
+                    caller,
+                    "emergency:revoke",
+                    scopes,
+                    "deny",
+                    "caller may not revoke this grant",
+                )
+                raise Forbidden(
+                    f"identity {caller.identity_id!r} may not revoke "
+                    f"emergency grant {grant_id!r}"
+                )
+            self._record_decision(caller, "emergency:revoke", scopes, "allow", None)
+            if grant.status != "approved":
+                raise AuthzConflict(
+                    f"emergency grant {grant_id!r} is {grant.status}; only an "
+                    "active (approved and unexpired) grant can be revoked"
+                )
+            if expected_version is not None and expected_version != grant.grant_version:
+                raise AuthzConflict(
+                    f"optimistic concurrency check failed for emergency grant "
+                    f"{grant_id!r}: expected version {expected_version}, "
+                    f"current {grant.grant_version}"
+                )
+            now = self._clock()
+            grant.status = "revoked"
+            grant.revoked_by = caller.identity_id
+            grant.revoked_at = now
+            grant.grant_version += 1
+            grant.updated_at = now
+            version = self._bump_version()
+            self._persist_grant(grant)
+            self._audit.record(
+                "emergency_grant",
+                self._grant_audit_details(
+                    "revoked", grant, caller.identity_id, version
+                ),
+            )
+            return grant
+
+    def get_grant(self, grant_id: str) -> EmergencyGrant:
+        with self._lock:
+            self._expire_overdue_grants()
+            grant = self._grants.get(grant_id)
+            if grant is None:
+                raise AuthzNotFound(f"emergency grant {grant_id!r} does not exist")
+            return grant
+
+    def list_grants(
+        self,
+        caller: Caller,
+        status: Optional[str] = None,
+        identity_id: Optional[str] = None,
+    ) -> list[EmergencyGrant]:
+        with self._lock:
+            self._expire_overdue_grants()
+            grants = [
+                g for g in self._grants.values() if self._grant_visible(caller, g)
+            ]
+            if status is not None:
+                grants = [g for g in grants if g.status == status]
+            if identity_id is not None:
+                grants = [g for g in grants if g.identity_id == identity_id]
+            return sorted(grants, key=lambda g: (g.requested_at, g.id))
+
+    def _grant_visible(self, caller: Caller, grant: EmergencyGrant) -> bool:
+        if caller.kind in ("bootstrap", "open"):
+            return True
+        if caller.identity_id in (grant.requested_by, grant.identity_id):
+            return True  # requesters and grantees always see their own grants
+        return self._delegable(caller, grant.permissions)
+
+    def grant_visible(self, caller: Caller, grant: EmergencyGrant) -> bool:
+        with self._lock:
+            return self._grant_visible(caller, grant)
+
+    def grant_view(self, grant: EmergencyGrant) -> dict:
+        """API view of a grant, with liveness computed against the store clock."""
+        with self._lock:
+            return grant.public(self._clock())
 
     # -- idempotency -----------------------------------------------------------
 

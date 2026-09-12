@@ -47,6 +47,17 @@ CREATE TABLE IF NOT EXISTS authz_meta (
     k TEXT PRIMARY KEY,
     v INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS authz_emergency_grants (
+    id           TEXT PRIMARY KEY,
+    identity_id  TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    expires_at   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_emergency_identity
+    ON authz_emergency_grants(identity_id, status);
 """
 
 
