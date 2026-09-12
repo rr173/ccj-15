@@ -276,7 +276,7 @@ class RateLimiter:
         return decision
 
     @staticmethod
-    def _policy_fingerprint(snap: Snapshot) -> str:
+    def _compute_policy_fingerprint(snap: Snapshot) -> str:
         tiers = [
             t.model_dump()
             for t in sorted(snap.all_rate_limit_tiers(), key=lambda t: t.id)
@@ -290,7 +290,7 @@ class RateLimiter:
 
     def replace_buckets(self, snap: Snapshot) -> int:
         """Replace buckets immediately after a new config version is applied."""
-        fingerprint = self._policy_fingerprint(snap)
+        fingerprint = self._compute_policy_fingerprint(snap)
         with self._lock:
             reset = len(self._buckets)
             self._buckets.clear()
