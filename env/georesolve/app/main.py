@@ -130,6 +130,17 @@ from .config_store import (
     VersionConflict,
     VersionNotFound,
 )
+from .disputes import (
+    DisputeApplyRequest,
+    DisputeConflict,
+    DisputeDecisionRequest,
+    DisputeNotFound,
+    DisputeRevokeRequest,
+    DisputeSpec,
+    DisputeStore,
+    DisputeSubmitRequest,
+    DISPUTE_STATUSES,
+)
 from .health import HealthChecker, HealthRegistry
 from .metering import (
     BudgetExceeded,
@@ -387,6 +398,7 @@ class Components:
         self.health = HealthRegistry()
         self.rate_limiter = RateLimiter(self.audit, time.time)
         self.metering = MeteringStore(db, self.audit, time.time)
+        self.disputes = DisputeStore(db, self.metering, self.audit, time.time)
         self.config.add_listener(
             self.rate_limiter.replace_buckets,
             self.rate_limiter.preview_replace,
@@ -1748,6 +1760,312 @@ def create_app(components: Components) -> FastAPI:
         return run_idempotent(
             idempotency_key, request, caller, req.model_dump(), produce
         )
+
+    # -- budget billing disputes -------------------------------------------
+
+    def _get_visible_dispute(caller: Caller, dispute_id: str) -> dict:
+        """Fetch a dispute and require budget:read over its tenant."""
+        dispute = comp.disputes.get(dispute_id)
+        comp.authz.authorize(
+            caller, "budget:read", [tenant_scope(dispute["tenant"])]
+        )
+        return dispute
+
+    @app.post("/v1/budget-disputes", status_code=201)
+    async def create_dispute(
+        req: DisputeSpec,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        # The tenant is the path-level resource; the body must provide it.
+        tenant = (req.tenant or "").strip().lower()
+        if not tenant:
+            raise HTTPException(
+                status_code=422, detail="tenant is required in the request body"
+            )
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(tenant)]
+        )
+
+        def produce():
+            dispute = comp.disputes.create(
+                req, tenant=tenant, actor=caller.identity_id
+            )
+            return 201, {"dispute": dispute}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.get("/v1/budget-disputes")
+    async def list_disputes(
+        tenant: Optional[str] = Query(default=None),
+        period_type: Optional[str] = Query(default=None),
+        period: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        since: Optional[float] = Query(default=None),
+        until: Optional[float] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        if status is not None and status not in DISPUTE_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"status must be one of {sorted(DISPUTE_STATUSES)}",
+            )
+        if period_type is not None and period_type not in PERIOD_TYPES:
+            raise HTTPException(
+                status_code=400, detail=f"period must be one of {PERIOD_TYPES}"
+            )
+        if since is not None and until is not None and until < since:
+            raise HTTPException(status_code=400, detail="until before since")
+        # A single-tenant query is authorized on that tenant; a global
+        # listing requires the action and is filtered to covered tenants.
+        if tenant is not None:
+            authorize_tenants(caller, "budget:read", [tenant])
+        else:
+            comp.authz.authorize(caller, "budget:read")
+        disputes = comp.disputes.list_disputes(
+            tenant=tenant, period_type=period_type, period=period,
+            status=status, since=since, until=until, limit=limit,
+        )
+        if tenant is None:
+            disputes = filter_tenant_rows(caller, "budget:read", disputes)
+        return {"disputes": disputes, "count": len(disputes)}
+
+    @app.get("/v1/budget-disputes/{dispute_id}")
+    async def get_dispute(
+        dispute_id: str, caller: Caller = Depends(authenticated)
+    ):
+        dispute = _get_visible_dispute(caller, dispute_id)
+        history = comp.disputes.history(dispute_id)
+        return {"dispute": dispute, "history": history}
+
+    @app.get("/v1/budget-disputes/{dispute_id}/history")
+    async def get_dispute_history(
+        dispute_id: str,
+        since: Optional[float] = Query(default=None),
+        until: Optional[float] = Query(default=None),
+        caller: Caller = Depends(authenticated),
+    ):
+        dispute = _get_visible_dispute(caller, dispute_id)
+        history = comp.disputes.history(
+            dispute_id, since=since, until=until
+        )
+        return {
+            "dispute_id": dispute_id,
+            "tenant": dispute["tenant"],
+            "history": history,
+        }
+
+    @app.post("/v1/budget-disputes/{dispute_id}/submit")
+    async def submit_dispute(
+        dispute_id: str,
+        req: DisputeSubmitRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        dispute = comp.disputes.get(dispute_id)
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(dispute["tenant"])]
+        )
+
+        def produce():
+            result = comp.disputes.submit(
+                dispute_id,
+                actor=caller.identity_id,
+                retroactive=req.retroactive,
+            )
+            return 200, {"dispute": result}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    def _decide_dispute(
+        dispute_id: str,
+        approve: bool,
+        req: DisputeDecisionRequest,
+        request: Request,
+        caller: Caller,
+        idempotency_key: Optional[str],
+    ):
+        # Fetch first only to resolve the tenant for the scope check; the
+        # store itself enforces that the decider is not the creator.
+        dispute = comp.disputes.get(dispute_id)
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(dispute["tenant"])]
+        )
+
+        def produce():
+            result = comp.disputes.decide(
+                dispute_id,
+                approve,
+                actor=caller.identity_id,
+                comment=req.comment,
+                expected_version=req.expected_version,
+            )
+            return 200, {"dispute": result}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.post("/v1/budget-disputes/{dispute_id}/approve")
+    async def approve_dispute(
+        dispute_id: str,
+        req: DisputeDecisionRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        return _decide_dispute(
+            dispute_id, True, req, request, caller, idempotency_key
+        )
+
+    @app.post("/v1/budget-disputes/{dispute_id}/reject")
+    async def reject_dispute(
+        dispute_id: str,
+        req: DisputeDecisionRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        return _decide_dispute(
+            dispute_id, False, req, request, caller, idempotency_key
+        )
+
+    @app.post("/v1/budget-disputes/{dispute_id}/apply")
+    async def apply_dispute(
+        dispute_id: str,
+        req: DisputeApplyRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        dispute = comp.disputes.get(dispute_id)
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(dispute["tenant"])]
+        )
+
+        def produce():
+            result = comp.disputes.apply(
+                dispute_id,
+                actor=caller.identity_id,
+                expected_version=req.expected_version,
+            )
+            return 200, {"dispute": result}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.post("/v1/budget-disputes/{dispute_id}/revoke")
+    async def revoke_dispute(
+        dispute_id: str,
+        req: DisputeRevokeRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        dispute = comp.disputes.get(dispute_id)
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(dispute["tenant"])]
+        )
+
+        def produce():
+            result = comp.disputes.revoke(
+                dispute_id,
+                actor=caller.identity_id,
+                reason=req.reason,
+                expected_version=req.expected_version,
+            )
+            return 200, {"dispute": result}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.get("/v1/budgets/{tenant}/adjustments")
+    async def list_tenant_adjustments(
+        tenant: str,
+        period_type: str = Query(default="day"),
+        period: Optional[str] = Query(default=None),
+        kind: Optional[str] = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=2000),
+        caller: Caller = Depends(authenticated),
+    ):
+        if period_type not in PERIOD_TYPES:
+            raise HTTPException(
+                status_code=400, detail=f"period must be one of {PERIOD_TYPES}"
+            )
+        if kind is not None and kind not in ("normal", "retroactive"):
+            raise HTTPException(
+                status_code=400,
+                detail="kind must be 'normal' or 'retroactive'",
+            )
+        comp.authz.authorize(
+            caller, "budget:read", [tenant_scope(tenant)]
+        )
+        adjustments = comp.disputes.list_adjustments(
+            tenant=tenant, period_type=period_type, period=period,
+            kind=kind, limit=limit,
+        )
+        return {"adjustments": adjustments, "count": len(adjustments)}
+
+    @app.get("/v1/budgets/{tenant}/adjusted")
+    async def get_adjusted_budget(
+        tenant: str,
+        period_type: str = Query(default="day"),
+        period: Optional[str] = Query(
+            default=None,
+            description="period label (YYYY-MM-DD / YYYY-MM); current if omitted",
+        ),
+        caller: Caller = Depends(authenticated),
+    ):
+        if period_type not in PERIOD_TYPES:
+            raise HTTPException(
+                status_code=400, detail=f"period must be one of {PERIOD_TYPES}"
+            )
+        comp.authz.authorize(
+            caller, "budget:read", [tenant_scope(tenant)]
+        )
+        try:
+            at = (
+                comp.disputes._parse_period(period, period_type)
+                if period is not None
+                else time.time()
+            )
+        except MeteringValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        projection = comp.disputes.adjusted_budget(
+            tenant, period_type, at
+        )
+        # Attach the governing policy and budget allowance when one exists so
+        # the adjusted usage can be compared against the budget threshold.
+        status = comp.metering.budget_status(
+            tenant, at=projection["period_start"]
+        )
+        if status is not None:
+            projection["budget"] = status["budget"]
+            projection["amount"] = status["amount"]
+            projection["policy_origin"] = status["policy_origin"]
+            projection["frozen"] = status["frozen"]
+        return projection
 
     # -- admin delegation ----------------------------------------------------
 

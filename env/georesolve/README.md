@@ -145,8 +145,52 @@
   所有语义拒绝（成环、覆盖到期、跨作用域状态写、并发迁移、自审批）都写
   `budget_policy_denied` 审计。
 
+### 计费争议单与预算调整（budget disputes）
+
+管理员可针对**某租户的指定周期**创建一笔计费争议单，引用一条或多条不可变用量
+事件，填写争议原因与需要调整的**带符号计费量**（负为核减、正为补收）。状态机：
+`draft → pending_review → approved → applied`，另可 `→ rejected`；
+`draft/pending_review/approved` 以及开放周期内**已应用**的争议单可 `revoked`，
+`rejected` 为终态，关闭周期的 retroactive 调整不可撤销。
+
+- **提交即冻结**（`draft → pending_review`，或创建时 `submit:true`）：在同一事务
+  内冻结引用事件的**完整清单**（按提交顺序）、该周期的**原始聚合**（按
+  租户×客户端×规则作用域的明细单元与总量）以及**当前预算策略来源与版本**
+  （override/tenant/group、source_id、source_version）。冻结后迟到事件、组变更、
+  成员迁移或覆盖撤销都不会改写该单的冻结内容；**原始用量事件永不被修改**。
+- **职责分离**：争议单必须由**另一名**持有该租户 `budget:write` 的管理员批准/驳回，
+  创建人不能审批自己的单（409，`self_approval` 审计）。批准、驳回、应用、撤销均支持
+  `expected_version` 乐观并发与 `Idempotency-Key`：并发操作由进程锁与 SQLite
+  事务串行化、条件更新兜底，**只有一方成功**；幂等键重复提交只重放原结果
+  （`idempotent_replay:true`，不重复写版本/审计/调整记录），同键不同载荷 409。
+- **应用是一个事务**：写入不可变的 `budget_adjustments` 调整记录（带符号量、
+  原始/调整后用量、策略来源），更新该周期的预算投影
+  `budget_usage_projections`，并按调整后投影重新判断阈值告警——已有告警
+  **只补缺、从不删除或改写**。应用后开放周期的**下一个解析请求立即**按新投影执行；
+  闸门响应与 `explain` 同时给出 `raw_used`、`normal_adjustment` 与投影后 `used`。
+- **关闭周期只能做 retroactive 调整**：提交/应用时若周期已关闭而未声明
+  `retroactive`，或开放周期却声明 `retroactive`，都明确拒绝（409，
+  `frozen_period` / `period_open`）。retroactive 调整只向不可变账本与审计追加
+  一笔**可追溯**记录，**不改变**该周期的预算投影、原告警事实或冻结策略快照；
+  视图以 `retroactive_adjustment` 与 `adjusted_including_retroactive` 单独呈现。
+  开放周期应用的普通调整在周期关闭后也不能再撤销（会改写冻结事实）。
+- **明确拒绝并保留拒绝审计**（`budget_policy_denied`，动作
+  `dispute_submit/decide/apply/revoke`）：引用不存在（`unknown_event`）、
+  跨租户引用（`cross_tenant_event`）、同单重复引用（`duplicate_event`）、
+  事件不属于争议周期（`event_wrong_period`）、调整后用量为负
+  （`negative_usage`）、操作已冻结的历史快照（`frozen_period`）、
+  状态机不符（`status_conflict_*`）。版本不符返回 409
+  （`expected_version`）。
+- **持久化与历史**：争议单、审批关系（`created_by`/`submitted_by`/`decided_by`/
+  `applied_by`/`revoked_by` 与时间戳）、不可变调整账本、版本冲突结果与追加式
+  生命周期事件流 `budget_dispute_events` 全部落 SQLite，重启后状态、版本、审计
+  顺序保持一致；列表与历史接口支持按 `since/until`（创建/事件时间）时间窗查询。
+- 审计类型 `budget_dispute`（created/submitted/approved/rejected/applied/revoked）；
+  拒绝写入既有 `budget_policy_denied`。重算（recompute）以明细重建聚合后会以
+  账本为准确保投影重新收敛。
+
 ### 并发、权限与审计
-- 预算行、预算组、成员关系、临时覆盖与告警行均带单调 `version`，写接口支持
+- 预算行、预算组、成员关系、临时覆盖、预算争议单与告警行均带单调 `version`，写接口支持
   `expected_version` 乐观并发（冲突 409）；
 - 所有写接口支持 `Idempotency-Key`：首个响应持久化，重复提交重放（不重复写事件/审计/
   版本），同键不同载荷 409；同内容预算 PUT 是无变化 no-op，重复确认返回 `changed:false`。
@@ -161,8 +205,10 @@
   版本）、`budget_alert`（fired/acknowledged，含阈值、用量、周期、是否 retroactive、
   触发时的 `policy_origin`、操作人）、`budget_group`、`budget_membership`、
   `budget_override`（requested/approved/rejected/revoked/expired）、
+  `budget_dispute`（created/submitted/approved/rejected/applied/revoked）、
   `budget_resolution`（每次真实解析所采用的来源/版本与闸门裁决）以及
-  `budget_policy_denied`（成环继承、窗口到期/重叠、自审批、并发迁移等语义拒绝）。
+  `budget_policy_denied`（成环继承、窗口到期/重叠、自审批、并发迁移、争议单
+  冻结/跨租户/负用量等语义拒绝）。
 
 ## 配置变更管理：预演、历史与回滚
 
@@ -336,7 +382,7 @@
 | `GET /v1/config/versions/{v}?payload=true` | 单个已保存版本：摘要、差异与（按作用域过滤的）bundle |
 | `POST /v1/config/rollback` | 回滚到已保存版本：以其内容生成**更高的新版本**，走与普通应用相同的校验、缓存失效、桶重置与审计流程；可带 `expected_version`/`preview_token`；仅全局作用域 |
 | `POST /v1/config/rollback/preview` | 回滚预演（不落任何变更）；仅全局作用域 |
-| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback`、`authz_decision`、`authz_denied`、`identity_change`、`role_change`、`emergency_grant`、`usage_event`、`usage_backfill`、`usage_recompute`、`budget_change`、`budget_alert`；按 `audit:read` 作用域过滤（记录带 `tenant`/`scope`） |
+| `GET /v1/audit?type=&limit=&since=` | 审计记录：`rule_change`、`release_group_change`、`release_group_hit`、`rate_limit_change`、`rate_limit_rejected`、`rate_limit_bucket_reset`、`cache_invalidation`、`health_change`、`config_applied`、`config_rollback`、`authz_decision`、`authz_denied`、`identity_change`、`role_change`、`emergency_grant`、`usage_event`、`usage_backfill`、`usage_recompute`、`budget_change`、`budget_alert`、`budget_dispute`（含拒绝时的 `budget_policy_denied`）；按 `audit:read` 作用域过滤（记录带 `tenant`/`scope`） |
 | `GET /v1/health/targets` | 目标健康视图，按 `health:read` 作用域过滤 |
 | `POST /v1/health/targets/{id}` | 手工健康覆盖（`{"healthy": bool}`）；要求目标的所有引用都在调用者 `health:write` 作用域内；写审计 |
 | `GET /v1/cache` / `POST /v1/cache/flush` | 缓存查看（按 `cache:read` 过滤）/ 按 `cache:flush` 作用域清空（清空会记审计） |
@@ -358,6 +404,15 @@
 | `POST /v1/budget-overrides/{id}/approve` / `.../reject` / `.../revoke` | 另一名覆盖该租户的 `budget:write` 管理员批准/拒绝（申请人不能自审批；支持 `comment`、`expected_version` 与幂等键）；批准后可撤销，立即恢复下层策略 |
 | `GET /v1/budget-alerts?tenant=&status=open\|acknowledged&period=day\|month` | 预算告警列表（按 `budget:read` 过滤） |
 | `POST /v1/budget-alerts/{id}/acknowledge` | 确认告警（`comment`、`expected_version`）；重复确认返回 `changed:false`；需 `budget:write` 覆盖该租户；支持 `Idempotency-Key` |
+| `POST /v1/budget-disputes` | 创建计费争议单（`tenant`、`period_type=day\|month`、`period` 标签（缺省当前周期）、`event_ids`、`reason`、带符号 `adjustment_quantity`、`retroactive`、`submit`）；`submit:false` 存为草稿，`true` 立即冻结事件清单/原始聚合/策略来源版本并进待复核；需该租户 `budget:write`；支持幂等键 |
+| `GET /v1/budget-disputes?tenant=&period_type=&period=&status=&since=&until=` | 争议单列表（按授权作用域过滤，时间窗按创建时间） |
+| `GET /v1/budget-disputes/{id}` / `GET .../history?since=&until=` | 争议单详情（含冻结载荷）与追加式生命周期事件流（创建→提交→批准/驳回→应用→撤销） |
+| `POST /v1/budget-disputes/{id}/submit` | 提交草稿（冻结引用/聚合/策略；关闭周期须 `retroactive:true`）；支持幂等键 |
+| `POST /v1/budget-disputes/{id}/approve` / `.../reject` | 另一名持该租户 `budget:write` 的管理员批准/驳回（创建人自审批 409；`comment`、`expected_version`）；支持幂等键 |
+| `POST /v1/budget-disputes/{id}/apply` | 应用已批准争议单：单事务写不可变调整记录、更新周期预算投影并重判阈值告警（开放周期立即生效；关闭周期仅当 `retroactive` 时只追加可追溯记录）；`expected_version` 与幂等键 |
+| `POST /v1/budget-disputes/{id}/revoke` | 撤销草稿/待复核/已批准单，或冲回开放周期内已应用的调整（追加反向不可变记录并刷新投影；关闭周期 retroactive 调整不可撤销）；`reason`、`expected_version`、幂等键 |
+| `GET /v1/budgets/{tenant}/adjustments?period_type=&period=&kind=normal\|retroactive` | 该租户周期的不可变调整账本 |
+| `GET /v1/budgets/{tenant}/adjusted?period_type=&period=` | 按租户周期查看调整后预算：原始用量、正常/retroactive 调整净额、调整后用量、账本行与未终结争议 |
 
 管理委托（需 `admin:manage`，写接口支持 `Idempotency-Key` 幂等重试）：
 

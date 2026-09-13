@@ -449,6 +449,8 @@ class BudgetDecision:
         thresholds: Optional[list[float]] = None,
         open_alerts: Optional[list[dict]] = None,
         origin: Optional[dict] = None,
+        raw_used: Optional[float] = None,
+        normal_adjustment: float = 0.0,
     ):
         self.budget = budget
         self.period_type = period_type
@@ -462,6 +464,10 @@ class BudgetDecision:
         self.thresholds = thresholds or []
         self.open_alerts = open_alerts or []
         self.origin = origin
+        #: Raw billed quantity from the immutable aggregates, before dispute
+        #: adjustments; equal to ``used`` when no dispute adjustment applies.
+        self.raw_used = raw_used if raw_used is not None else used
+        self.normal_adjustment = normal_adjustment
 
     @property
     def remaining(self) -> float:
@@ -487,8 +493,11 @@ class BudgetDecision:
             "period_start": self.period_started_at,
             "amount": self.amount,
             "used": self.used,
+            "raw_used": self.raw_used,
+            "normal_adjustment": self.normal_adjustment,
             "remaining": remaining,
             "usage_ratio": self.usage_ratio,
+            "adjusted": abs(self.normal_adjustment) > 1e-12,
             "policy": self.policy if self.budget is not None else None,
             "allowed": self.allowed,
             "degraded": self.degraded,
@@ -524,6 +533,16 @@ class MeteringStore:
         self._lock = threading.RLock()
 
     # -- helpers -------------------------------------------------------------
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Reentrant mutation lock, shared with sibling budget stores.
+
+        The dispute/adjustment store serializes against event ingestion and
+        budget writes through this same lock, so an adjustment transaction
+        can never interleave with an event transaction.
+        """
+        return self._lock
 
     @staticmethod
     def _budget_row(row: sqlite3.Row) -> dict:
@@ -2018,6 +2037,93 @@ class MeteringStore:
         ).fetchone()
         return float(row["q"])
 
+    # -- immutable adjustments and the budget usage projection ---------------
+
+    def _adjustment_delta(
+        self,
+        conn: sqlite3.Connection,
+        tenant: str,
+        start: float,
+        period_type: str,
+        kind: str,
+    ) -> float:
+        """Net signed adjustment delta of one ledger kind for a period.
+
+        ``normal`` deltas alter the open period's projection; ``retroactive``
+        deltas only append traceable history to a closed period. A reverse
+        row carries the negated quantity, so a plain SUM yields the net.
+        """
+        row = conn.execute(
+            "SELECT COALESCE(SUM(quantity), 0) AS q FROM budget_adjustments"
+            " WHERE period_type = ? AND period_start = ? AND tenant = ?"
+            " AND kind = ?",
+            (period_type, start, tenant, kind),
+        ).fetchone()
+        return float(row["q"])
+
+    def _refresh_projection(
+        self,
+        conn: sqlite3.Connection,
+        tenant: str,
+        start: float,
+        period_type: str,
+        now: float,
+    ) -> None:
+        """Upsert the period's materialized budget projection.
+
+        Raw billed quantity is recomputed from the immutable aggregates and
+        the normal adjustment delta from the immutable adjustment ledger, so
+        a rebuild always converges; retroactive adjustments never enter the
+        gate projection.
+        """
+        raw = self._period_used(tenant, start, period_type)
+        delta = self._adjustment_delta(
+            conn, tenant, start, period_type, "normal"
+        )
+        conn.execute(
+            "INSERT INTO budget_usage_projections"
+            " (period_type, period_start, tenant, raw_quantity,"
+            "  adjustment_delta, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(period_type, period_start, tenant) DO UPDATE SET"
+            "  raw_quantity=excluded.raw_quantity,"
+            "  adjustment_delta=excluded.adjustment_delta,"
+            "  updated_at=excluded.updated_at",
+            (period_type, start, tenant, raw, delta, now),
+        )
+
+    def _period_usage(
+        self,
+        tenant: str,
+        start: float,
+        period_type: str,
+        *,
+        include_retroactive: bool = False,
+    ) -> dict:
+        """Raw, net-adjusted and retroactive usage for one period.
+
+        The budget gate and threshold evaluation use ``adjusted``
+        (raw + net normal delta); a retroactive-only view additionally
+        includes closed-period retroactive adjustments, which exist solely
+        to document corrected historical usage and never feed the gate.
+        """
+        conn = self._conn
+        raw = self._period_used(tenant, start, period_type)
+        normal = self._adjustment_delta(conn, tenant, start, period_type, "normal")
+        retroactive = self._adjustment_delta(
+            conn, tenant, start, period_type, "retroactive"
+        )
+        adjusted = raw + normal
+        return {
+            "raw": raw,
+            "normal_adjustment": normal,
+            "retroactive_adjustment": retroactive,
+            "adjusted": adjusted,
+            "adjusted_including_retroactive": (
+                adjusted + retroactive if include_retroactive else adjusted
+            ),
+        }
+
     # -- alerts ---------------------------------------------------------------
 
     @staticmethod
@@ -2207,6 +2313,14 @@ class MeteringStore:
                     PERIOD_DAY, pstart, tenant, client_key, rule_scope,
                     quantity, result, now, self._conn,
                 )
+                # Keep both period projections aligned with the immutable
+                # aggregates; normal adjustment deltas are preserved because
+                # the projection refresh recomputes them from the ledger.
+                for ptype in PERIOD_TYPES:
+                    self._refresh_projection(
+                        self._conn, tenant,
+                        period_start(event_time, ptype), ptype, now,
+                    )
 
                 # Threshold alerts follow the policy governing the period the
                 # *event time* belongs to: the live policy for the open
@@ -2220,11 +2334,19 @@ class MeteringStore:
                 )
                 if effective is not None and quantity > 0:
                     bstart = period_start(event_time, effective.period_type)
-                    used = self._period_used(
+                    usage = self._period_usage(
                         tenant, bstart, effective.period_type
                     )
                     retroactive = bstart < period_start(
                         now, effective.period_type
+                    )
+                    # Open periods evaluate against the dispute-adjusted
+                    # projection (applied disputes take effect immediately);
+                    # closed periods keep the raw historical fact -- their
+                    # retroactive adjustments append traceability but never
+                    # rewrite the alerts the period actually fired.
+                    used_for_alerts = (
+                        usage["raw"] if retroactive else usage["adjusted"]
                     )
                     created_alerts = self._evaluate_thresholds(
                         tenant=tenant,
@@ -2232,7 +2354,7 @@ class MeteringStore:
                         amount=effective.amount,
                         thresholds=list(effective.alert_thresholds),
                         start=bstart,
-                        used=used,
+                        used=used_for_alerts,
                         event_id=event_id,
                         fired_at=now if retroactive else event_time,
                         retroactive=retroactive,
@@ -2359,8 +2481,14 @@ class MeteringStore:
             origin = effective.origin()
             ptype = effective.period_type
             start = period_start(now, ptype)
-            used = self._period_used(tenant, start, ptype)
-            projected = used + max(0.0, amount_to_charge)
+            # The gate projects against the dispute-adjusted usage: an
+            # applied open-period dispute takes effect for the very next
+            # resolution, while closed-period retroactive adjustments never
+            # reach the open-period gate by construction.
+            usage = self._period_usage(tenant, start, ptype)
+            raw_used = usage["raw"]
+            used_adjusted = usage["adjusted"]
+            projected = used_adjusted + max(0.0, amount_to_charge)
             over = projected > effective.amount + 1e-9
             open_alerts = self._open_alerts(tenant, start, ptype)
 
@@ -2380,6 +2508,8 @@ class MeteringStore:
                     thresholds=thresholds,
                     open_alerts=open_alerts,
                     origin=origin,
+                    raw_used=raw_used,
+                    normal_adjustment=used_adjusted - raw_used,
                 )
 
             if not over:
@@ -2399,7 +2529,7 @@ class MeteringStore:
                 )
             else:
                 result = decision(
-                    used_qty=used, allowed=False, degraded=False,
+                    used_qty=used_adjusted, allowed=False, degraded=False,
                     reason="budget_exceeded",
                 )
             if audit_resolution:
@@ -2795,8 +2925,14 @@ class MeteringStore:
                 effective = probe
                 frozen = False
             start = period_start(at, effective.period_type)
-            used = self._period_used(
-                tenant, start, effective.period_type
+            usage = self._period_usage(
+                tenant, start, effective.period_type,
+                include_retroactive=historical,
+            )
+            used = (
+                usage["adjusted_including_retroactive"]
+                if historical
+                else usage["adjusted"]
             )
             nxt = next_period_start(at, effective.period_type)
             budget = {
@@ -2815,6 +2951,20 @@ class MeteringStore:
                 "period_end": nxt,
                 "period": period_label(start, effective.period_type),
                 "used": used,
+                # Adjusted-usage attribution: raw billed quantity, the net
+                # normal delta applied to the projection, and (for closed
+                # periods) the traceable retroactive delta that does not
+                # alter the period's projection or its fired alerts.
+                "raw_used": usage["raw"],
+                "normal_adjustment": usage["normal_adjustment"],
+                "retroactive_adjustment": usage["retroactive_adjustment"],
+                "adjusted": (
+                    abs(usage["normal_adjustment"]) > 1e-12
+                    or (
+                        historical
+                        and abs(usage["retroactive_adjustment"]) > 1e-12
+                    )
+                ),
                 "amount": effective.amount,
                 "remaining": max(0.0, effective.amount - used),
                 "usage_ratio": used / effective.amount if effective.amount else None,
@@ -2999,6 +3149,19 @@ class MeteringStore:
                         ),
                     )
 
+                # Rebuild the materialized per-period projections from the
+                # rebuilt aggregates and the immutable adjustment ledger, so
+                # the gate's adjusted usage agrees with both sources.
+                projection_keys = {
+                    (ptype, period_start(e["event_time"], ptype), e["tenant"])
+                    for e in events
+                    for ptype in PERIOD_TYPES
+                }
+                for ptype, pstart, t in sorted(projection_keys):
+                    self._refresh_projection(
+                        self._conn, t, pstart, ptype, rebuild_at
+                    )
+
                 # Resolve (and persist, freezing closed periods) the policy
                 # governing each distinct event period, then reconcile
                 # missing threshold crossings against it.
@@ -3014,8 +3177,11 @@ class MeteringStore:
                     policies[(e["tenant"], bstart)] = policy
                 for (t, bstart), policy in policies.items():
                     ptype = policy.period_type
-                    used = self._period_used(t, bstart, ptype)
+                    usage = self._period_usage(t, bstart, ptype)
                     retroactive = bstart < period_start(rebuild_at, ptype)
+                    # Closed periods keep their raw historical fact; only
+                    # the open period re-evaluates against adjusted usage.
+                    used = usage["raw"] if retroactive else usage["adjusted"]
                     fired_alerts.extend(
                         self._evaluate_thresholds(
                             tenant=t,

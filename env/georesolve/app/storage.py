@@ -238,6 +238,125 @@ CREATE TABLE IF NOT EXISTS budget_policy_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_policy_snapshots_tenant
     ON budget_policy_snapshots(tenant, period_start);
+
+-- Budget billing disputes. A dispute cites one or more immutable usage
+-- events in one tenant period and proposes a signed billing adjustment.
+-- At submission (draft -> pending_review) the cited event list, the raw
+-- period aggregates and the resolved budget policy (source + version) are
+-- frozen into this row; later event backfills, group edits, migrations or
+-- override changes never rewrite the freeze. Lifecycle:
+--   draft -> pending_review -> approved -> applied
+--                           \-> rejected
+--   draft/pending_review/approved -> revoked
+--   applied (open period, normal) -> revoked (append-only reverse)
+CREATE TABLE IF NOT EXISTS budget_disputes (
+    id                  TEXT PRIMARY KEY,
+    tenant              TEXT NOT NULL,
+    period_type         TEXT NOT NULL,
+    period_start        REAL NOT NULL,
+    reason              TEXT NOT NULL DEFAULT '',
+    adjustment_quantity REAL NOT NULL,
+    retroactive         INTEGER NOT NULL DEFAULT 0,
+    status              TEXT NOT NULL DEFAULT 'draft',
+    event_count         INTEGER NOT NULL DEFAULT 0,
+    frozen_events       TEXT,
+    frozen_aggregates   TEXT,
+    frozen_policy       TEXT,
+    frozen_at           REAL,
+    created_by          TEXT NOT NULL,
+    created_at          REAL NOT NULL,
+    submitted_by        TEXT,
+    submitted_at        REAL,
+    decided_by          TEXT,
+    decided_at          REAL,
+    decision_comment    TEXT,
+    applied_by          TEXT,
+    applied_at          REAL,
+    revoked_by          TEXT,
+    revoked_at          REAL,
+    revoke_reason       TEXT,
+    version             INTEGER NOT NULL DEFAULT 1,
+    updated_at          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_disputes_tenant
+    ON budget_disputes(tenant, period_type, period_start);
+CREATE INDEX IF NOT EXISTS idx_disputes_status ON budget_disputes(status);
+CREATE INDEX IF NOT EXISTS idx_disputes_created ON budget_disputes(created_at, id);
+
+-- Cited usage events of a dispute, frozen in the exact submission order.
+-- References are only validated at submission time (a draft may cite an
+-- event id before it is verified); the immutable usage_events rows
+-- themselves are never modified.
+CREATE TABLE IF NOT EXISTS budget_dispute_refs (
+    dispute_id TEXT NOT NULL,
+    event_id   TEXT NOT NULL,
+    position   INTEGER NOT NULL,
+    PRIMARY KEY (dispute_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_refs_event
+    ON budget_dispute_refs(event_id);
+
+-- Append-only lifecycle timeline of a dispute. Every transition appends
+-- exactly one row, never updated or deleted, so the approval chain and
+-- audit ordering survive restarts.
+CREATE TABLE IF NOT EXISTS budget_dispute_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    dispute_id  TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    actor       TEXT,
+    action      TEXT NOT NULL,
+    from_status TEXT,
+    to_status   TEXT,
+    version     INTEGER NOT NULL,
+    details     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_events_dispute
+    ON budget_dispute_events(dispute_id, id);
+CREATE INDEX IF NOT EXISTS idx_dispute_events_ts
+    ON budget_dispute_events(ts, id);
+
+-- Immutable adjustment ledger. Applying an approved dispute appends one
+-- 'apply' row (signed quantity); revoking an open-period applied dispute
+-- appends a 'reverse' row. Rows are never updated or deleted. ``kind`` is
+-- 'normal' for open-period projections (read by the budget gate) and
+-- 'retroactive' for closed periods (traceable only; they never alter the
+-- period's gate projection or the alerts the period actually fired).
+CREATE TABLE IF NOT EXISTS budget_adjustments (
+    id                TEXT PRIMARY KEY,
+    dispute_id        TEXT NOT NULL,
+    tenant            TEXT NOT NULL,
+    period_type       TEXT NOT NULL,
+    period_start      REAL NOT NULL,
+    kind              TEXT NOT NULL,
+    direction         TEXT NOT NULL,
+    quantity          REAL NOT NULL,
+    reverses_id       TEXT,
+    raw_quantity      REAL NOT NULL,
+    adjusted_quantity REAL NOT NULL,
+    policy_origin     TEXT,
+    actor             TEXT NOT NULL,
+    created_at        REAL NOT NULL,
+    UNIQUE(dispute_id, direction)
+);
+CREATE INDEX IF NOT EXISTS idx_adjustments_period
+    ON budget_adjustments(tenant, period_type, period_start, kind);
+
+-- Materialized per-period budget projection: raw billed quantity (the
+-- immutable aggregates) plus the net normal adjustment delta. The gate
+-- and the "adjusted budget" view read this projection; it is updated in
+-- the same transaction as the immutable adjustment row. Retroactive
+-- adjustments deliberately never touch a closed period's projection.
+CREATE TABLE IF NOT EXISTS budget_usage_projections (
+    period_type      TEXT NOT NULL,
+    period_start     REAL NOT NULL,
+    tenant           TEXT NOT NULL,
+    raw_quantity     REAL NOT NULL,
+    adjustment_delta REAL NOT NULL DEFAULT 0,
+    updated_at       REAL NOT NULL,
+    PRIMARY KEY (period_type, period_start, tenant)
+);
+CREATE INDEX IF NOT EXISTS idx_projections_tenant
+    ON budget_usage_projections(tenant, period_start);
 """
 
 
