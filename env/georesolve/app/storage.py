@@ -811,6 +811,10 @@ CREATE TABLE IF NOT EXISTS health_alert_deliveries (
     sub_id         TEXT NOT NULL,
     sub_version    INTEGER NOT NULL,         -- frozen subscription snapshot
     snapshot       TEXT NOT NULL,            -- full subscription payload at fire
+    signing_secret TEXT,                     -- secret frozen at delivery
+                                                -- creation; retries/replays
+                                                -- sign with this, never a
+                                                -- later rotation of the sub
     event_payload  TEXT NOT NULL,            -- frozen webhook body
     status         TEXT NOT NULL,            -- pending|sending|succeeded|failed|dead|suppressed
     attempts       INTEGER NOT NULL DEFAULT 0,
@@ -854,4 +858,16 @@ def connect(db_path: str) -> sqlite3.Connection:
     alert_cols = {r["name"] for r in conn.execute("PRAGMA table_info(budget_alerts)")}
     if "policy_origin" not in alert_cols:
         conn.execute("ALTER TABLE budget_alerts ADD COLUMN policy_origin TEXT")
+    # Delivery rows freeze the signing secret that was current when the event
+    # was generated, so secret rotation never changes how an old event is
+    # signed on retry/replay. Databases created before this column existed
+    # backfill lazily from the frozen sub_version revision.
+    delivery_cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(health_alert_deliveries)")
+    }
+    if "signing_secret" not in delivery_cols:
+        conn.execute(
+            "ALTER TABLE health_alert_deliveries ADD COLUMN signing_secret TEXT"
+        )
     return conn

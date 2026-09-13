@@ -614,14 +614,18 @@
   `suppressed`，到窗口结束自动转 `pending`，期间不发送；手工 replay 可强制
   跳过静默立即投递。
 - 每条投递**冻结创建时的订阅快照**（URL、headers、阈值、静默窗口、重试策略、
-  `sub_version`）：订阅更新只追加新版本修订，旧事件永远按原快照投递；删除订阅
-  为软删除并追加删除修订，未确认的连续判定作废，但已入队的投递按快照继续发完。
+  `sub_version` 以及当时的 `signing_secret`）：订阅更新只追加新版本修订，旧事件
+  永远按原快照投递；删除订阅为软删除并追加删除修订，未确认的连续判定作废，但已
+  入队的投递按快照继续发完。因此**轮换签名密钥不影响已生成事件**——重试、崩溃
+  回收与 replay 都用投递行冻结的原密钥签名，接收方按首次投递的密钥始终可验签；
+  冻结的密钥不在任何读取接口回显。
 
 ### 投递、重试与重启不丢
 - 投递是持久化 outbox：`pending → sending → succeeded/failed → dead`。POST
   JSON 到 webhook，2xx 成功；请求带 `Idempotency-Key`（=投递 uid）、
   `X-Georesolve-Event-Uid/Type`、`X-Georesolve-Subscription: id/version`；
-  配置了 `signing_secret` 时附 `X-Georesolve-Signature: sha256=<HMAC-SHA256>`。
+  配置了 `signing_secret` 时附 `X-Georesolve-Signature: sha256=<HMAC-SHA256>`，
+  签名密钥取投递生成时冻结的原密钥（订阅后续轮换不改变旧事件的签名）。
 - 失败按指数退避重试：`min(backoff_max, backoff_base * 2**(attempts-1))`，
   超过 `max_retries`（首次尝试之后允许的重试次数）置 `dead`，可通过 replay
   重新入队。认领即写 `sending` 并设回收截止时间，**进程崩溃后到点自动回收**

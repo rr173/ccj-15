@@ -367,6 +367,62 @@ def test_old_event_delivers_with_original_snapshot_after_edit(client, env,
                                                             "version": 1}
 
 
+def test_secret_rotation_keeps_old_event_signed_with_original_secret(
+        client, env, hook_server):
+    import hashlib
+    import hmac as _hmac
+
+    _, comp = env
+    client.put("/v1/health/targets/b1/policy",
+               json=policy_body(), headers=HEADERS)
+    r = client.post(
+        "/v1/health/alert-subscriptions",
+        json=sub_body(webhook_url=hook_server, signing_secret="old-key",
+                      max_retries=3, backoff_base_seconds=0.01),
+        headers=HEADERS,
+    ).json()
+    sid = r["subscription"]["sub_id"]
+    _force_failure(client)
+
+    def expected_sig(secret: str, raw: bytes) -> str:
+        return "sha256=" + _hmac.new(
+            secret.encode(), raw, hashlib.sha256
+        ).hexdigest()
+
+    # Rotate the signing secret after the event/delivery were generated,
+    # then fail the first attempt and retry: both must verify under the old
+    # key frozen on the delivery row, not the rotated subscription key.
+    upd = client.put(
+        f"/v1/health/alert-subscriptions/{sid}",
+        json=sub_body(webhook_url=hook_server, signing_secret="new-key",
+                      max_retries=3, backoff_base_seconds=0.01,
+                      expected_version=1),
+        headers=HEADERS,
+    )
+    assert upd.status_code == 200
+
+    _Handler.fail_times = 1
+    import asyncio
+    import time as _time
+    asyncio.run(comp.alerts.dispatch_once())  # attempt 1 -> 503
+    # Backoff base is 10ms: wait past it so the retry is due on the next tick.
+    _time.sleep(0.02)
+    asyncio.run(comp.alerts.dispatch_once())  # attempt 2 -> 202
+    assert len(_Handler.received) == 2
+    for received in _Handler.received:
+        raw = json.dumps(received["body"], sort_keys=True).encode()
+        sig = received["headers"]["X-Georesolve-Signature"]
+        assert sig == expected_sig("old-key", raw)
+        assert sig != expected_sig("new-key", raw)
+
+    # The frozen secret is never exposed on delivery read endpoints.
+    did = client.get("/v1/health/alert-deliveries",
+                     headers=HEADERS).json()["deliveries"][0]["id"]
+    d = client.get(f"/v1/health/alert-deliveries/{did}",
+                   headers=HEADERS).json()["delivery"]
+    assert "signing_secret" not in d and "old-key" not in json.dumps(d)
+
+
 def test_pending_delivery_survives_process_restart(tmp_path, hook_server):
     import asyncio
     from app.storage import connect as db_connect

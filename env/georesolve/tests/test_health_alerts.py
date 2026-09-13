@@ -417,6 +417,136 @@ def test_successful_delivery_sends_signed_payload(af):
     assert asyncio.run(af.alerts.dispatch_once()) == []
 
 
+def _valid_hmac(secret: str, call: dict) -> bool:
+    import hashlib
+    import hmac as _hmac
+
+    expected = "sha256=" + _hmac.new(
+        secret.encode(), call["body"], hashlib.sha256
+    ).hexdigest()
+    return _hmac.compare_digest(
+        expected, call["headers"]["X-Georesolve-Signature"]
+    )
+
+
+def _rotate_secret(af, sid: str, new_secret: str) -> None:
+    af.alerts.update_subscription(
+        sid,
+        SubscriptionUpsertIn(
+            target_id="a",
+            webhook_url="http://hooks.example/alert",
+            signing_secret=new_secret,
+            expected_version=1,
+        ),
+    )
+
+
+def test_retries_after_secret_rotation_keep_signing_with_frozen_secret(af):
+    # A delivery generated under the old key must keep HMAC-ing with that key
+    # on every later attempt even after the admin rotates the subscription's
+    # signing secret; otherwise the receiver cannot verify old events.
+    af.health.upsert_policy("a", policy())
+    created, _ = af.alerts.create_subscription(
+        sub(signing_secret="old-secret", max_retries=3,
+            backoff_base_seconds=1.0)
+    )
+    sid = created["sub_id"]
+    _fail_target(af)
+    sender = ScriptedSender([
+        SendOutcome(ok=False, status_code=503, error="HTTP 503"),  # attempt 1
+        SendOutcome(ok=True, status_code=200),                    # attempt 2
+    ])
+    af.alerts._sender = sender
+    asyncio.run(af.alerts.dispatch_once())
+    assert _valid_hmac("old-secret", sender.calls[0])
+    # Rotate between attempts while the delivery is parked on backoff.
+    _rotate_secret(af, sid, "new-secret")
+    assert af.alerts.get_subscription(sid)["signing_secret"] == "new-secret"
+    af.clock.advance(2)
+    asyncio.run(af.alerts.dispatch_once())
+    assert af.alerts.list_deliveries()["deliveries"][0]["status"] == ST_SUCCEEDED
+    # The retry still carries a signature valid under the original key and
+    # not under the rotated one.
+    assert _valid_hmac("old-secret", sender.calls[1])
+    assert not _valid_hmac("new-secret", sender.calls[1])
+
+
+def test_replay_after_secret_rotation_uses_original_secret(af):
+    af.health.upsert_policy("a", policy())
+    created, _ = af.alerts.create_subscription(
+        sub(signing_secret="old-secret")
+    )
+    sid = created["sub_id"]
+    _fail_target(af)
+    sender = ScriptedSender([SendOutcome(ok=True, status_code=200)])
+    af.alerts._sender = sender
+    asyncio.run(af.alerts.dispatch_once())
+    assert _valid_hmac("old-secret", sender.calls[0])
+    _rotate_secret(af, sid, "new-secret")
+    # Manual replay reuses the frozen delivery row (payload/uid unchanged);
+    # the redelivery must still sign with the original secret.
+    ev_id = af.alerts.list_events()["events"][0]["id"]
+    af.alerts.replay_event(ev_id)
+    asyncio.run(af.alerts.dispatch_once())
+    assert len(sender.calls) == 2
+    assert _valid_hmac("old-secret", sender.calls[1])
+    assert not _valid_hmac("new-secret", sender.calls[1])
+
+
+def test_secret_added_after_generation_does_not_sign_old_delivery(af):
+    # A delivery generated while the subscription had no secret was unsigned;
+    # adding one later must not retroactively sign that frozen old event.
+    af.health.upsert_policy("a", policy())
+    created, _ = af.alerts.create_subscription(sub())
+    sid = created["sub_id"]
+    _fail_target(af)
+    _rotate_secret(af, sid, "added-later")
+    sender = ScriptedSender([SendOutcome(ok=True, status_code=200)])
+    af.alerts._sender = sender
+    asyncio.run(af.alerts.dispatch_once())
+    assert "X-Georesolve-Signature" not in sender.calls[0]["headers"]
+
+
+def test_delivery_api_dict_never_carries_the_frozen_secret(af):
+    af.health.upsert_policy("a", policy())
+    af.alerts.create_subscription(sub(signing_secret="topsecret"))
+    _fail_target(af)
+    d = af.alerts.list_deliveries()["deliveries"][0]
+    assert "signing_secret" not in d
+    full = af.alerts.get_delivery(d["id"])
+    assert "signing_secret" not in full
+    assert full["snapshot"]["has_signing_secret"] is True
+
+
+def test_legacy_delivery_backfills_secret_from_frozen_revision(af, tmp_path):
+    # Simulate a pre-upgrade database: delivery rows exist without a frozen
+    # signing_secret column value. The key is recovered from the immutable
+    # revision of the sub_version the delivery was generated against, and a
+    # later rotation still yields the original key.
+    af.health.upsert_policy("a", policy())
+    created, _ = af.alerts.create_subscription(
+        sub(signing_secret="old-secret")
+    )
+    sid = created["sub_id"]
+    _fail_target(af)
+    # Wipe the frozen column as it would be for a legacy row.
+    af.db.execute(
+        "UPDATE health_alert_deliveries SET signing_secret = NULL"
+    )
+    af.db.commit()
+    _rotate_secret(af, sid, "new-secret")
+    sender = ScriptedSender([SendOutcome(ok=True, status_code=200)])
+    af.alerts._sender = sender
+    asyncio.run(af.alerts.dispatch_once())
+    assert _valid_hmac("old-secret", sender.calls[0])
+    assert not _valid_hmac("new-secret", sender.calls[0])
+    # The resolution was backfilled onto the row.
+    stored = af.db.execute(
+        "SELECT signing_secret FROM health_alert_deliveries"
+    ).fetchone()
+    assert stored["signing_secret"] == "old-secret"
+
+
 def test_failed_delivery_retries_with_exponential_backoff_then_dies(af):
     af.health.upsert_policy("a", policy())
     af.alerts.create_subscription(sub(

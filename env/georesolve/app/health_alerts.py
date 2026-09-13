@@ -44,9 +44,13 @@ nothing is sent meanwhile. Manual replay always forces a send.
 Snapshots
 ---------
 Each delivery freezes the full subscription payload (and sub_version) at
-activation/matching time: editing or deleting a subscription appends a new
-revision but never rewrites an old event's snapshot -- "旧事件只能按原订阅
-快照投递".
+activation/matching time, **including the signing secret**: editing or
+deleting a subscription appends a new revision but never rewrites an old
+event's snapshot -- "旧事件只能按原订阅快照投递". Rotating a subscription's
+signing secret therefore never changes how an already generated event is
+signed: retries, crash reclaim and manual replay all HMAC the body with the
+secret frozen on the delivery row, so a receiver that verified the first
+attempt keeps verifying later attempts.
 
 Retries / restart
 -----------------
@@ -765,14 +769,15 @@ class AlertStore:
             self._conn.execute(
                 "INSERT OR IGNORE INTO health_alert_deliveries"
                 " (delivery_uid, event_id, sub_id, sub_version, snapshot,"
-                "  event_payload, status, attempts, max_retries,"
+                "  signing_secret, event_payload, status, attempts, max_retries,"
                 "  next_attempt_at, last_error, last_status_code, sent_at,"
                 "  created_at, updated_at, replayed_count)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
                 (
                     f"hdel-{event_uid}-{s['sub_id']}", event_id, s["sub_id"],
                     s["sub_version"],
                     json.dumps(self._snapshot_payload(sub), sort_keys=True),
+                    s["signing_secret"],
                     json.dumps(payload, sort_keys=True), status, 0,
                     s["max_retries"], next_at, None, None, None, now, now,
                 ),
@@ -781,7 +786,13 @@ class AlertStore:
 
     @staticmethod
     def _snapshot_payload(sub: dict) -> dict:
-        """What an old event keeps delivering with, regardless of later edits."""
+        """What an old event keeps delivering with, regardless of later edits.
+
+        The public snapshot only carries ``has_signing_secret``; the secret
+        itself is frozen alongside on the delivery row's ``signing_secret``
+        column (never exposed on the read API) so a rotated subscription key
+        cannot change the signature of retries/replays.
+        """
         return {
             "sub_id": sub["sub_id"],
             "sub_version": sub["sub_version"],
@@ -1056,7 +1067,7 @@ class AlertStore:
             headers["X-Georesolve-Replay-Count"] = str(
                 delivery["replayed_count"]
             )
-        secret = self._signing_secret(delivery["sub_id"])
+        secret = self._delivery_signing_secret(delivery)
         if secret:
             headers["X-Georesolve-Signature"] = "sha256=" + hmac.new(
                 secret.encode(), body, hashlib.sha256
@@ -1065,9 +1076,41 @@ class AlertStore:
             headers[k] = v
         return snap["webhook_url"], headers, body
 
-    def _signing_secret(self, sub_id: str) -> Optional[str]:
-        row = self._get_sub_row(sub_id)
-        return row["signing_secret"] if row is not None else None
+    def _delivery_signing_secret(self, delivery: dict) -> Optional[str]:
+        """The secret this delivery must sign with: the one frozen when the
+        event was generated, never the subscription's current secret.
+
+        Rows created before secrets were frozen per-delivery (column NULL on
+        a pre-upgrade database) resolve it from the immutable revision of the
+        frozen ``sub_version`` they were generated against and backfill the
+        column, so retry/replay after a rotation still verifies with the
+        original key. There is deliberately no fallback to the live
+        subscription row: that lookup is the rotation bug this replaces.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT signing_secret FROM health_alert_deliveries WHERE id = ?",
+                (delivery["id"],),
+            ).fetchone()
+            if row is None:
+                return None
+            secret = row["signing_secret"]
+            if secret is not None:
+                return secret
+            rev = self._conn.execute(
+                "SELECT payload FROM health_alert_sub_revisions"
+                " WHERE sub_id = ? AND sub_version = ?",
+                (delivery["sub_id"], delivery["sub_version"]),
+            ).fetchone()
+            if rev is not None:
+                secret = json.loads(rev["payload"]).get("signing_secret")
+                self._conn.execute(
+                    "UPDATE health_alert_deliveries SET signing_secret = ?"
+                    " WHERE id = ?",
+                    (secret, delivery["id"]),
+                )
+                self._conn.commit()
+            return secret
 
     def send_delivery(self, delivery: dict) -> SendOutcome:
         """Perform one blocking webhook attempt (run in a worker thread)."""
