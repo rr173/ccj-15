@@ -483,17 +483,35 @@ class HealthCheckStore:
         audit: AuditLog,
         clock: Callable[[], float] = time.time,
         view_ttl: float = 0.25,
+        on_history_commit: Optional[Callable[[], None]] = None,
     ):
         self._conn = conn
         self._config = config
         self._audit = audit
         self._clock = clock
         self._lock = threading.RLock()
+        # Optional callback fired after every commit that may have appended
+        # check/transition history (used by the health-alert ingestor to
+        # wake immediately instead of waiting for its polling tick).
+        self._on_history_commit = on_history_commit
         # Short-lived materialized view so the per-resolution is_healthy()
         # hot path stays in memory (the resolver calls it for every target).
         self._view_ttl = view_ttl
         self._view_cache: Optional[dict] = None
         self._view_at: float = -1.0
+
+    def set_history_commit_listener(
+        self, callback: Optional[Callable[[], None]]
+    ) -> None:
+        self._on_history_commit = callback
+
+    def _notify_history_commit(self) -> None:
+        cb = self._on_history_commit
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001 - alerting must never break checks
+                pass
 
     def _invalidate_view(self) -> None:
         self._view_cache = None
@@ -816,6 +834,7 @@ class HealthCheckStore:
             self._conn.commit()
             self._invalidate_view()
             self._audit_transition(target_id)
+            self._notify_history_commit()
         return self._state_to_dict(self._state_row(target_id))
 
     @staticmethod
@@ -1014,6 +1033,7 @@ class HealthCheckStore:
             if st is not None and st["paused"]:
                 pass
             policy = self._load_policy(target_id)
+            self._notify_history_commit()
             return policy, created
 
     @staticmethod
@@ -1163,6 +1183,7 @@ class HealthCheckStore:
             )
             if state is not None:
                 self._audit_transition(target_id)
+            self._notify_history_commit()
 
     # -- pause / resume / override ------------------------------------------
 
@@ -1236,6 +1257,7 @@ class HealthCheckStore:
                 },
                 ts=now,
             )
+            self._notify_history_commit()
             return {"changed": True, "state": st}
 
     def resume(
@@ -1296,6 +1318,7 @@ class HealthCheckStore:
             self._conn.commit()
             self._invalidate_view()
             self._audit_transition(target_id)
+            self._notify_history_commit()
             return {"changed": True, "state": st}
 
     def override(
@@ -1388,6 +1411,7 @@ class HealthCheckStore:
                 },
                 ts=now,
             )
+            self._notify_history_commit()
             return {"changed": True, "state": st}
 
     def _require_existing_target(self, target_id: str) -> None:
@@ -1445,6 +1469,7 @@ class HealthCheckStore:
             self._conn.commit()
             self._invalidate_view()
             self._audit_transition(target_id)
+            self._notify_history_commit()
             return {"changed": True, "state": st}
 
     # -- check execution / state machine ------------------------------------
@@ -1609,6 +1634,10 @@ class HealthCheckStore:
         self._invalidate_view()
         if transition_seq is not None:
             self._audit_transition(target_id)
+        # Every check row may advance a subscription's consecutive-threshold
+        # confirmation even when the effective state itself did not flip, so
+        # the alert ingestor is notified for both kinds of appends.
+        self._notify_history_commit()
 
         st = self._state_to_dict(self._state_row(target_id))
         return {

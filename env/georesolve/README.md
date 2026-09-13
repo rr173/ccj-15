@@ -587,6 +587,70 @@
 | `POST /v1/health/targets/{id}/check` | 立即执行一轮检查（维护/暂停时返回 `ran:false` 与原因） |
 | `POST /v1/health/targets/{id}` | 兼容旧接口：等价于无到期手工覆盖 |
 
+## 健康事件订阅与告警抑制（health alerts）
+
+在健康检查编排之上，管理员可订阅状态转换事件并通过 Webhook 投递。订阅按
+**目标**（`target_id`，`"*"` 表示所有目标）与**状态来源**（`check` /
+`manual_override` / `maintenance` / `"*"`）选择事件，并自带**连续阈值确认**、
+静默窗口、重试退避与目标地址。
+
+### 事件类型与去重
+- 仅五类有效状态转换生成事件：检查阈值翻转为不健康（`unhealthy`）、阈值恢复
+  （`recovered`）、维护窗口进入/退出（`maintenance_begin`/`maintenance_end`）、
+  手工覆盖到期（`override_expired`）。暂停/恢复/策略增删改不产生告警。
+- 事件表按 `(target_id, 转换历史行 id)` 唯一去重并落 SQLite：同一转换无论监听
+  回调触发几次、重启后补扫几次，都只有一个事件、每个订阅一条投递。事件游标
+  首次运行种子化为当时最新历史行，因此**新建订阅不会回放订阅前的旧转换**。
+- 每个事件携带转换前后健康、来源、`state_version`/`policy_version`、目标转换
+  `seq` 与稳定 `event_uid`；列表支持 `target_id`、`event_type`、`status`、
+  `subscription_id`、`since` 过滤。
+
+### 连续阈值、静默与快照
+- `consecutive_threshold`（默认 1）只作用于 check 来源事件：转换先建
+  `unconfirmed` 投递，后续同向失败/成功检查计数，达到阈值才激活（`pending`）；
+  期间一次反向检查立即将其置为 `superseded`。维护/覆盖事件不经连续判定，立即
+  激活。
+- `silence_windows[]`（`[start,end,note)`）：事件激活时落在静默窗口内则记为
+  `suppressed`，到窗口结束自动转 `pending`，期间不发送；手工 replay 可强制
+  跳过静默立即投递。
+- 每条投递**冻结创建时的订阅快照**（URL、headers、阈值、静默窗口、重试策略、
+  `sub_version`）：订阅更新只追加新版本修订，旧事件永远按原快照投递；删除订阅
+  为软删除并追加删除修订，未确认的连续判定作废，但已入队的投递按快照继续发完。
+
+### 投递、重试与重启不丢
+- 投递是持久化 outbox：`pending → sending → succeeded/failed → dead`。POST
+  JSON 到 webhook，2xx 成功；请求带 `Idempotency-Key`（=投递 uid）、
+  `X-Georesolve-Event-Uid/Type`、`X-Georesolve-Subscription: id/version`；
+  配置了 `signing_secret` 时附 `X-Georesolve-Signature: sha256=<HMAC-SHA256>`。
+- 失败按指数退避重试：`min(backoff_max, backoff_base * 2**(attempts-1))`，
+  超过 `max_retries`（首次尝试之后允许的重试次数）置 `dead`，可通过 replay
+  重新入队。认领即写 `sending` 并设回收截止时间，**进程崩溃后到点自动回收**
+  （at-least-once，接收方按幂等键去重）。pending/failed/suppressed/attempts/
+  next_attempt_at/last_error/last_status_code 全部落库，重启不丢。
+- 后台 worker 周期性执行：补扫历史 → 释放到期静默 → 认领并并发发送；健康存储
+  每次提交检查/转换行后也即时唤醒补扫。可注入发送器（测试用），生产使用内置
+  urllib 发送器（无额外运行时依赖）。
+
+### 订阅并发、幂等与演练隔离
+- 订阅更新**必须带 `expected_version`**（与当前 `sub_version` 不符 409；同内容
+  PUT 为 no-op 不升版本）；创建/更新/删除/replay 均支持 `Idempotency-Key`，
+  重复键重放原响应（`idempotent_replay:true`），不重复升版本/写审计。删除支持
+  `?expected_version=`。`"*"` 目标订阅需要全局 `health:write/read`；具体目标
+  沿用语义化的 `health:write/read` 作用域授权。
+- 故障演练使用私有内存健康注册表，**从不写 `health_check_history`**，告警管道
+  只读该表，因此演练的模拟失败不可能触发线上告警（有测试固化）。
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /v1/health/alert-subscriptions` | 创建订阅（201，幂等键；响应不回显签名密钥） |
+| `GET /v1/health/alert-subscriptions` / `.../{id}` | 列表（按作用域过滤）/查看（已删除 404） |
+| `PUT /v1/health/alert-subscriptions/{id}` | 更新（必须 `expected_version`，追加版本修订，幂等键） |
+| `DELETE /v1/health/alert-subscriptions/{id}?expected_version=` | 软删除（追加删除修订；已入队投递继续按快照发完） |
+| `GET /v1/health/alert-events?target_id=&event_type=&status=&subscription_id=&since=` | 去重事件列表（含每条投递状态摘要） |
+| `GET /v1/health/alert-events/{id}` | 单事件及全部投递（含冻结快照/载荷） |
+| `POST /v1/health/alert-events/{id}/replay` | 强制按原快照重新投递（跳过静默；未确认/已取代事件 409；幂等键） |
+| `GET /v1/health/alert-deliveries?subscription_id=&event_id=&status=` / `.../{id}` | 投递状态查询（尝试次数、下次尝试、错误、状态码、replay 次数） |
+
 ## API
 
 数据面（无需认证）：

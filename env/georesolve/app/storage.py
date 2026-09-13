@@ -721,6 +721,124 @@ CREATE INDEX IF NOT EXISTS idx_health_hist_version
     ON health_check_history(policy_version);
 CREATE INDEX IF NOT EXISTS idx_health_hist_ts
     ON health_check_history(ts, id);
+
+-- ======================================================================
+-- Health event subscriptions and alert delivery
+--
+-- Subscriptions select transitions by target ('*' = every target) and
+-- status source (check / manual_override / maintenance / '*') and carry
+-- their own consecutive-threshold confirmation, silence windows, retry
+-- policy and webhook endpoint. A subscription is versioned; every update
+-- appends an immutable revision, and each generated event freezes the
+-- matching subscription revision so later edits never change what an old
+-- event is delivered as.
+--
+-- health_alert_events is the deduplicated, persisted event stream: one row
+-- per (target_id, transition history id). Thresholded check-sourced
+-- transitions start 'unconfirmed' and only become active (and create a
+-- delivery row) after enough consecutive same-verdict checks, or are
+-- superseded by an opposite transition. health_alert_deliveries is the
+-- outbox: a row exists exactly when an event must be (or has been) sent to
+-- one subscription, with next_attempt_at/attempts/last_error persisted
+-- after every attempt so a crashed/retrying webhook is never lost.
+-- ======================================================================
+CREATE TABLE IF NOT EXISTS health_alert_subscriptions (
+    sub_id        TEXT PRIMARY KEY,
+    sub_version   INTEGER NOT NULL DEFAULT 1,
+    target_id     TEXT NOT NULL,             -- '*' matches every target
+    sources       TEXT NOT NULL,             -- JSON list of status sources
+    consecutive_threshold INTEGER NOT NULL DEFAULT 1,
+    webhook_url   TEXT NOT NULL,
+    headers       TEXT NOT NULL DEFAULT '{}',
+    signing_secret TEXT,
+    silence_windows TEXT NOT NULL DEFAULT '[]',  -- JSON list of [start,end,note)
+    max_retries   INTEGER NOT NULL DEFAULT 5,
+    backoff_base_seconds REAL NOT NULL DEFAULT 1.0,
+    backoff_max_seconds REAL NOT NULL DEFAULT 300.0,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    deleted       INTEGER NOT NULL DEFAULT 0,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    created_by    TEXT,
+    updated_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_health_alert_subs_target
+    ON health_alert_subscriptions(target_id, enabled, deleted);
+
+CREATE TABLE IF NOT EXISTS health_alert_sub_revisions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sub_id      TEXT NOT NULL,
+    sub_version INTEGER NOT NULL,
+    action      TEXT NOT NULL,               -- created|updated|deleted
+    payload     TEXT NOT NULL,
+    actor       TEXT,
+    ts          REAL NOT NULL,
+    UNIQUE(sub_id, sub_version)
+);
+CREATE INDEX IF NOT EXISTS idx_health_alert_sub_rev
+    ON health_alert_sub_revisions(sub_id, sub_version);
+
+CREATE TABLE IF NOT EXISTS health_alert_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_uid     TEXT NOT NULL UNIQUE,      -- stable id sent in the webhook
+    target_id     TEXT NOT NULL,
+    transition_id INTEGER NOT NULL,          -- health_check_history.id
+    transition_seq INTEGER NOT NULL,         -- per-target seq at the transition
+    event_type    TEXT NOT NULL,             -- unhealthy|recovered|maintenance_begin|maintenance_end|override_expired
+    source        TEXT NOT NULL,             -- effective status source
+    from_healthy  INTEGER,
+    to_healthy    INTEGER,
+    state_version INTEGER,
+    policy_version INTEGER,
+    detail        TEXT NOT NULL DEFAULT '{}',
+    ts            REAL NOT NULL,
+    status        TEXT NOT NULL,             -- unconfirmed|active|superseded|suppressed
+    confirm_count INTEGER NOT NULL DEFAULT 0,
+    threshold     INTEGER NOT NULL DEFAULT 1,
+    activated_at  REAL,
+    UNIQUE(target_id, transition_id)
+);
+CREATE INDEX IF NOT EXISTS idx_health_alert_ev_status
+    ON health_alert_events(status, id);
+CREATE INDEX IF NOT EXISTS idx_health_alert_ev_target
+    ON health_alert_events(target_id, ts);
+
+CREATE TABLE IF NOT EXISTS health_alert_deliveries (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_uid   TEXT NOT NULL UNIQUE,     -- Idempotency-Key sent to the webhook
+    event_id       INTEGER NOT NULL
+                   REFERENCES health_alert_events(id),
+    sub_id         TEXT NOT NULL,
+    sub_version    INTEGER NOT NULL,         -- frozen subscription snapshot
+    snapshot       TEXT NOT NULL,            -- full subscription payload at fire
+    event_payload  TEXT NOT NULL,            -- frozen webhook body
+    status         TEXT NOT NULL,            -- pending|sending|succeeded|failed|dead|suppressed
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    max_retries    INTEGER NOT NULL,
+    next_attempt_at REAL,
+    last_error     TEXT,
+    last_status_code INTEGER,
+    sent_at        REAL,
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL,
+    replayed_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_health_alert_del_due
+    ON health_alert_deliveries(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_health_alert_del_event
+    ON health_alert_deliveries(event_id);
+CREATE INDEX IF NOT EXISTS idx_health_alert_del_sub
+    ON health_alert_deliveries(sub_id, id);
+
+-- Cursor of the alert ingestor into health_check_history (global id order).
+-- A missing row means "start from the newest history id" so creating a
+-- subscription never replays the pre-existing past; after a restart every
+-- unprocessed row is scanned and UNIQUE(target_id, transition_id) makes
+-- catch-up idempotent.
+CREATE TABLE IF NOT EXISTS health_alert_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 

@@ -44,6 +44,17 @@ Control plane (authenticated; see app.authz for the delegation model):
   POST /v1/health/targets/{id}/pause|/resume - suspend checking / resume
   POST /v1/health/targets/{id}/check   - run one check round immediately
   POST /v1/health/targets/{id}         - legacy override (permanent)
+  POST /v1/health/alert-subscriptions  - subscribe to health events by
+                                         target/source (threshold, silence
+                                         windows, retry/backoff, webhook)
+  GET/PUT/DELETE .../alert-subscriptions[/{id}] - list/get/update (
+                                         expected_version required)/delete
+  GET  /v1/health/alert-events[/{id}]  - deduplicated event stream / detail
+  POST /v1/health/alert-events/{id}/replay - force redelivery on the frozen
+                                         subscription snapshot (bypasses
+                                         silence); Idempotency-Key supported
+  GET  /v1/health/alert-deliveries[/{id}] - outbox delivery status (attempts,
+                                         next attempt, last error, replay count)
   GET  /v1/cache               - cache contents, filtered by cache:read
   POST /v1/cache/flush         - drop cached answers inside the caller's
                                  cache:flush scope (audited)
@@ -217,6 +228,14 @@ from .drills import (
     TransitionIn,
 )
 from .health import HealthChecker, HealthRegistry
+from .health_alerts import (
+    AlertConflict,
+    AlertNotFound,
+    AlertStore,
+    AlertValidation,
+    AlertWorker,
+    SubscriptionUpsertIn,
+)
 from .health_checks import (
     HealthCheckConflict,
     HealthCheckNotFound,
@@ -501,7 +520,14 @@ class Components:
         # (per-target policies, thresholded state machines, overrides,
         # maintenance windows and append-only history, all SQLite-backed).
         self.health = HealthCheckStore(db, self.config, self.audit, time.time)
+        # Health event subscriptions + alert delivery tail the health store's
+        # append-only history (deduplicated, SQLite outbox, retry/backoff).
+        # The commit listener only wakes the ingestor; the cursor scan itself
+        # is idempotent, and drills never write the history table.
+        self.alerts = AlertStore(db, self.config, self.audit, time.time)
+        self.health.set_history_commit_listener(self.alerts.ingest_new)
         self.health_scheduler = HealthScheduler(self.health)
+        self.alert_worker = AlertWorker(self.alerts)
         # The plain in-memory registry and the global-interval checker are
         # retained for standalone/library use and existing unit tests.
         self.health_registry = HealthRegistry()
@@ -569,6 +595,7 @@ class Components:
             return
         self._stop = asyncio.Event()
         self._tasks.append(asyncio.create_task(self.health_scheduler.run(self._stop)))
+        self._tasks.append(asyncio.create_task(self.alert_worker.run(self._stop)))
         if self.config_file:
             self._tasks.append(asyncio.create_task(self._watch_config_file(self._stop)))
 
@@ -716,6 +743,27 @@ def create_app(components: Components) -> FastAPI:
 
     @app.exception_handler(HealthCheckValidation)
     async def _health_check_validation(_req, exc: HealthCheckValidation):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(AlertNotFound)
+    async def _alert_not_found(_req, exc: AlertNotFound):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(AlertConflict)
+    async def _alert_conflict(_req, exc: AlertConflict):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(AlertValidation)
+    async def _alert_validation(_req, exc: AlertValidation):
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": str(exc), "code": exc.code},
@@ -1558,6 +1606,246 @@ def create_app(components: Components) -> FastAPI:
         return run_idempotent(
             idempotency_key, request, caller, body, produce
         )
+
+    # -- health event subscriptions / alerts --------------------------------
+
+    def authorize_alert_target_write(caller: Caller, target_id: str):
+        """Wildcard subscriptions need global write; a concrete target
+        follows the same scope authorization as health policies."""
+        if target_id == "*":
+            if not full_access(caller, "health:write"):
+                raise Forbidden(
+                    "target '*' requires global health:write scope"
+                )
+            return []
+        return authorize_health_write(caller, target_id)
+
+    def authorize_alert_target_read(caller: Caller, target_id: str):
+        if target_id == "*":
+            if not full_access(caller, "health:read"):
+                raise Forbidden(
+                    "target '*' requires global health:read scope"
+                )
+            return []
+        return authorize_health_read(caller, target_id)
+
+    def _sub_view(sub: dict) -> dict:
+        """Subscription response: never echo the signing secret."""
+        out = dict(sub)
+        secret = out.pop("signing_secret", None)
+        out["signing_secret_set"] = secret is not None
+        return out
+
+    def _visible_target_ids(caller: Caller, action: str) -> Optional[set[str]]:
+        """None means the caller sees every target; otherwise the scoped set."""
+        if full_access(caller, action):
+            return None
+        grants = caller.grants(action)
+        snap = comp.config.snapshot()
+        return {
+            t.id
+            for item in (*snap.all_rules(), *snap.all_release_groups())
+            if covered_by(grants, item)
+            for t in item.targets
+        }
+
+    def _require_subscription_visible(caller: Caller, sub: dict) -> dict:
+        authorize_alert_target_read(caller, sub["target_id"])
+        return sub
+
+    @app.post("/v1/health/alert-subscriptions", status_code=201)
+    async def create_alert_subscription(
+        req: SubscriptionUpsertIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_alert_target_write(caller, req.target_id)
+
+        def produce():
+            sub, _created = comp.alerts.create_subscription(
+                req, actor=caller.identity_id
+            )
+            return 201, {"subscription": _sub_view(sub), "created": True}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.get("/v1/health/alert-subscriptions")
+    async def list_alert_subscriptions(
+        include_deleted: bool = False,
+        caller: Caller = Depends(authenticated),
+    ):
+        comp.authz.authorize(caller, "health:read")
+        visible = _visible_target_ids(caller, "health:read")
+        subs = comp.alerts.list_subscriptions(include_deleted=include_deleted)
+        if visible is not None:
+            subs = [s for s in subs if s["target_id"] in visible]
+        return {
+            "subscriptions": [_sub_view(s) for s in subs],
+            "count": len(subs),
+        }
+
+    @app.get("/v1/health/alert-subscriptions/{sub_id}")
+    async def get_alert_subscription(
+        sub_id: str, caller: Caller = Depends(authenticated)
+    ):
+        sub = comp.alerts.get_subscription(sub_id)
+        if sub.get("deleted"):
+            raise AlertNotFound(f"no subscription {sub_id!r}")
+        _require_subscription_visible(caller, sub)
+        return {"subscription": _sub_view(sub)}
+
+    @app.put("/v1/health/alert-subscriptions/{sub_id}")
+    async def update_alert_subscription(
+        sub_id: str,
+        req: SubscriptionUpsertIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        existing = comp.alerts.get_subscription(sub_id)
+        authorize_alert_target_write(caller, existing["target_id"])
+        authorize_alert_target_write(caller, req.target_id)
+
+        def produce():
+            sub, changed = comp.alerts.update_subscription(
+                sub_id, req, actor=caller.identity_id
+            )
+            return 200, {
+                "subscription": _sub_view(sub),
+                "changed": changed,
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"sub_id": sub_id, **req.model_dump()}, produce,
+        )
+
+    @app.delete("/v1/health/alert-subscriptions/{sub_id}")
+    async def delete_alert_subscription(
+        sub_id: str,
+        request: Request,
+        expected_version: Optional[int] = Query(default=None, ge=1),
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        existing = comp.alerts.get_subscription(sub_id)
+        authorize_alert_target_write(caller, existing["target_id"])
+
+        def produce():
+            comp.alerts.delete_subscription(
+                sub_id,
+                expected_version=expected_version,
+                actor=caller.identity_id,
+            )
+            return 200, {"deleted": sub_id}
+
+        return run_idempotent(
+            idempotency_key, request, caller, {}, produce
+        )
+
+    @app.get("/v1/health/alert-events")
+    async def list_alert_events(
+        target_id: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        event_type: Optional[str] = Query(default=None),
+        subscription_id: Optional[str] = Query(default=None),
+        since: Optional[float] = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        comp.authz.authorize(caller, "health:read")
+        if target_id is not None:
+            authorize_alert_target_read(caller, target_id)
+        result = comp.alerts.list_events(
+            target_id=target_id,
+            status=status,
+            event_type=event_type,
+            sub_id=subscription_id,
+            since=since,
+            limit=limit,
+        )
+        visible = _visible_target_ids(caller, "health:read")
+        if visible is not None:
+            events = [e for e in result["events"]
+                      if e["target_id"] in visible]
+            result = {"events": events, "count": len(events),
+                      "order": result["order"]}
+        return result
+
+    @app.get("/v1/health/alert-events/{event_id}")
+    async def get_alert_event(
+        event_id: int, caller: Caller = Depends(authenticated)
+    ):
+        ev = comp.alerts.get_event(event_id)
+        authorize_alert_target_read(caller, ev["target_id"])
+        return {"event": ev}
+
+    @app.post("/v1/health/alert-events/{event_id}/replay")
+    async def replay_alert_event(
+        event_id: int,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        ev = comp.alerts.get_event(event_id)
+        authorize_alert_target_write(caller, ev["target_id"])
+
+        def produce():
+            result = comp.alerts.replay_event(
+                event_id, actor=caller.identity_id
+            )
+            return 200, {"event": result, "replayed": True}
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"event_id": event_id}, produce,
+        )
+
+    @app.get("/v1/health/alert-deliveries")
+    async def list_alert_deliveries(
+        subscription_id: Optional[str] = Query(default=None),
+        event_id: Optional[int] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        comp.authz.authorize(caller, "health:read")
+        result = comp.alerts.list_deliveries(
+            sub_id=subscription_id,
+            event_id=event_id,
+            status=status,
+            limit=limit,
+        )
+        visible = _visible_target_ids(caller, "health:read")
+        if visible is not None:
+            kept = []
+            for d in result["deliveries"]:
+                ev = comp.alerts.get_event(d["event_id"])
+                if ev["target_id"] in visible:
+                    kept.append(d)
+            result = {"deliveries": kept, "count": len(kept),
+                      "order": result["order"]}
+        return result
+
+    @app.get("/v1/health/alert-deliveries/{delivery_id}")
+    async def get_alert_delivery(
+        delivery_id: int, caller: Caller = Depends(authenticated)
+    ):
+        delivery = comp.alerts.get_delivery(delivery_id)
+        ev = comp.alerts.get_event(delivery["event_id"])
+        authorize_alert_target_read(caller, ev["target_id"])
+        return {"delivery": delivery}
 
     @app.get("/v1/cache")
     async def get_cache(caller: Caller = Depends(authenticated)):
