@@ -112,17 +112,57 @@
   告警，重算也只补缺、从不删除已有告警。告警用 `POST .../acknowledge` 确认，
   未确认告警跨重启保持。
 
+### 租户组继承与临时覆盖
+- **预算组**（budget group）用 `POST /v1/budget-groups?group_id=` 创建，可携带默认
+  预算四元组（周期、预算量、阈值、超预算策略）；`parent_id` 指向父组时本组可不定义
+  策略而沿父链继承。组链必须无环，自环/成环的创建与修改返回 **409** 并写
+  `budget_policy_denied`。组的每次变更自增 `version` 并把全量状态归档进
+  `budget_group_revisions`，供历史周期回溯。
+- 租户用 `POST /v1/budget-groups/{id}/members?tenant=` 加入或迁入某组
+  （`DELETE /v1/budget-groups/members/{tenant}` 移出）。成员行带独立 `version`，
+  迁移支持 `expected_version`：并发迁移同一租户时只有一方成功，另一方得到 **409**
+  （`concurrent_migration`，并审计）。成员关系的每次变迁都追加一条
+  `budget_group_membership_history` 区间，记录该租户在任意历史时刻属于哪个组。
+- **策略解析链**（高优先级在前）：生效中的临时覆盖 → 租户专属预算 → 所属组默认策略
+  （含沿父链继承）。解析结果（`GET /v1/budgets/{tenant}/resolved`、闸门响应的
+  `budget.policy_origin`、预算查询）都给出 `source`（`override`/`tenant`/`group`）、
+  `source_id`、`source_version`，组继承时还区分 `group_id`（实际定义策略的组）与
+  `member_group_id`（租户直接所属组）。
+- 组策略变更、成员迁移、覆盖批准或撤销都在进程锁下实时计算，**下一个解析请求立即**
+  按新策略执行（无缓存）。
+- **临时覆盖**：租户管理员用 `POST /v1/budgets/{tenant}/overrides` 申请一段带
+  `[window_start, window_end)` 时间窗的覆盖；覆盖在另一名持有该租户 `budget:write`
+  的管理员 `.../approve` 之前完全无效（申请人不能审批自己的请求，违反返回 409 并写
+  `self_approval` 审计）。窗口已结束的申请/批准被拒绝；两个未终结覆盖的窗口不得重叠
+  （409，`window_overlap`）。批准后可由申请人或授权管理员 `.../revoke` 立即撤销；
+  窗口到期由惰性过期处理（状态翻为 `expired` 并审计），到期/终结后不再参与解析。
+- **历史周期快照**：每个 `(租户, 周期)` 首次观测时在 `budget_policy_snapshots`
+  记录实际采用的策略来源与版本。仍在开放的周期跟随当前链（每次事件刷新来源/版本）；
+  周期关闭后的第一次观测按**周期关闭边界**回溯当时有效的成员关系、组修订与覆盖并
+  **冻结**，此后组变更、成员迁移或覆盖撤销都不会改写历史周期的告警/重算。
+  `GET /v1/budgets/{tenant}?at=<epoch>` 返回该历史时刻的解析（优先使用冻结快照）。
+- 跨作用域修改（租户管理员建组/迁成员/改其它租户的覆盖）在授权层直接 **403**；
+  所有语义拒绝（成环、覆盖到期、跨作用域状态写、并发迁移、自审批）都写
+  `budget_policy_denied` 审计。
+
 ### 并发、权限与审计
-- 预算行与告警行带单调 `version`，写接口支持 `expected_version` 乐观并发（冲突 409）；
+- 预算行、预算组、成员关系、临时覆盖与告警行均带单调 `version`，写接口支持
+  `expected_version` 乐观并发（冲突 409）；
 - 所有写接口支持 `Idempotency-Key`：首个响应持久化，重复提交重放（不重复写事件/审计/
   版本），同键不同载荷 409；同内容预算 PUT 是无变化 no-op，重复确认返回 `changed:false`。
 - 权限动作：`metering:read`（明细/聚合查看）、`metering:backfill`（补录，须覆盖全部
   涉及租户）、`metering:recompute`（重算，全量仅全局作用域）、`budget:read`、
   `budget:write`。作用域与规则同构（global ⊇ region ⊇ tenant）：区域管理员可管理
-  任意租户预算，但租户管理员不能越权到其它租户/区域/全局；列表类接口按授权作用域过滤。
-- 审计类型：`usage_event`（每条事件，含结果/计费量/事件时间/来源/触发告警）、
-  `usage_backfill`、`usage_recompute`、`budget_change`（新旧值与版本）、
-  `budget_alert`（fired/acknowledged，含阈值、用量、周期、是否 retroactive、操作人）。
+  任意租户预算、审批/撤销该租户的临时覆盖；预算组与成员迁移属于跨租户资源，仅
+  **全局** `budget:write` 可操作（且迁成员还须覆盖该租户）；租户管理员不能越权到
+  其它租户/区域/全局；列表类接口按授权作用域过滤。
+- 审计类型：`usage_event`（每条事件，含结果/计费量/事件时间/来源/触发告警/解析所用
+  策略来源与版本）、`usage_backfill`、`usage_recompute`、`budget_change`（新旧值与
+  版本）、`budget_alert`（fired/acknowledged，含阈值、用量、周期、是否 retroactive、
+  触发时的 `policy_origin`、操作人）、`budget_group`、`budget_membership`、
+  `budget_override`（requested/approved/rejected/revoked/expired）、
+  `budget_resolution`（每次真实解析所采用的来源/版本与闸门裁决）以及
+  `budget_policy_denied`（成环继承、窗口到期/重叠、自审批、并发迁移等语义拒绝）。
 
 ## 配置变更管理：预演、历史与回滚
 
@@ -304,9 +344,18 @@
 | `GET /v1/metering/aggregates?period=day\|month&tenant=&start=&end=&group_by_client=&group_by_scope=` | 日/月窗口聚合统计（事件数、计费量、served/degraded/rejected 分项），周期按 UTC 对齐事件时间 |
 | `POST /v1/metering/backfill` | 事件补录：按各自 `event_time` 归档并折叠进聚合/告警，重复 `event_id` 跳过不重复计费；需 `metering:backfill` 覆盖全部涉及租户；支持 `Idempotency-Key` |
 | `POST /v1/metering/recompute` | 以明细日志为唯一事实源重建窗口内聚合并对账阈值告警（迟到/乱序/漂移自愈，已有告警不删除，缺失穿越补记为 retroactive）；带租户时需覆盖该租户，全量重算仅全局作用域；支持 `Idempotency-Key` |
-| `GET /v1/budgets` / `GET /v1/budgets/{tenant}` | 预算列表（按 `budget:read` 过滤）/ 单租户当前周期用量、余量、使用率、周期边界与未确认告警 |
+| `GET /v1/budgets` / `GET /v1/budgets/{tenant}` | 预算列表（按 `budget:read` 过滤）/ 单租户当前周期用量、余量、使用率、周期边界与未确认告警；后者可带 `at=<epoch>` 查询历史时刻解析（优先用冻结快照，返回 `policy_origin` 与 `frozen`） |
+| `GET /v1/budgets/{tenant}/resolved` | 只解析生效策略：来源 `override/tenant/group`、`source_id`/`source_version`、所属组与覆盖窗口；可带 `at` 做历史回溯 |
 | `PUT /v1/budgets/{tenant}` | 设置/替换租户预算（`period_type=day/month`、`amount`、`alert_thresholds`、`over_policy=allow/degrade/reject`、`expected_version`）；同内容 PUT 为无变化 no-op；需 `budget:write` 覆盖该租户；支持 `Idempotency-Key` |
 | `DELETE /v1/budgets/{tenant}` | 删除租户预算（明细与历史告警保留） |
+| `POST /v1/budget-groups?group_id=` / `GET /v1/budget-groups` / `GET /v1/budget-groups/{id}` | 创建预算组（默认策略四元组或 `parent_id` 继承；成环 409）/ 列表（含成员数，按授权过滤）/ 详情（含成员）；组写操作仅全局 `budget:write`，均支持 `expected_version` 与 `Idempotency-Key` |
+| `PUT /v1/budget-groups/{id}` / `DELETE /v1/budget-groups/{id}` | 更新组策略/父组（自增版本并归档修订；同内容 no-op）/ 删除空组（有成员或子组时 409） |
+| `POST /v1/budget-groups/{id}/members?tenant=` | 把租户加入或迁入该组（`expected_version` 乐观锁，并发迁移一方 409；需全局 `budget:write` 且覆盖该租户；支持幂等键） |
+| `DELETE /v1/budget-groups/members/{tenant}?expected_version=` | 把租户移出组（关闭成员关系区间；同上授权） |
+| `GET /v1/budget-groups/members/{tenant}/history` | 租户的组成员关系时间区间（迁移审计/历史回溯依据） |
+| `POST /v1/budgets/{tenant}/overrides` | 申请临时覆盖（策略四元组 + `window_start/window_end` + `reason`）；需该租户 `budget:write`；窗口重叠或已结束返回 409；支持幂等键 |
+| `GET /v1/budget-overrides?tenant=&status=` / `GET /v1/budget-overrides/{id}` | 覆盖列表（按授权过滤）/ 详情 |
+| `POST /v1/budget-overrides/{id}/approve` / `.../reject` / `.../revoke` | 另一名覆盖该租户的 `budget:write` 管理员批准/拒绝（申请人不能自审批；支持 `comment`、`expected_version` 与幂等键）；批准后可撤销，立即恢复下层策略 |
 | `GET /v1/budget-alerts?tenant=&status=open\|acknowledged&period=day\|month` | 预算告警列表（按 `budget:read` 过滤） |
 | `POST /v1/budget-alerts/{id}/acknowledge` | 确认告警（`comment`、`expected_version`）；重复确认返回 `changed:false`；需 `budget:write` 覆盖该租户；支持 `Idempotency-Key` |
 

@@ -64,6 +64,34 @@ All admin mutations accept an `Idempotency-Key` header: the first response
 is persisted and replayed for duplicate submissions (no duplicate version
 bumps or audit records); reusing the key with a different payload is a 409.
 Every authorization decision, denial and identity/role change is audited.
+
+Tenant budget groups and temporary overrides
+--------------------------------------------
+  POST   /v1/budget-groups?group_id=   - create a group with a default
+                                         budget or a parent_id to inherit
+  GET    /v1/budget-groups             - list groups (member_count)
+  GET    /v1/budget-groups/{id}        - one group and its members
+  PUT    /v1/budget-groups/{id}        - update policy/parent (versioned;
+                                         cyclic inheritance -> 409)
+  DELETE /v1/budget-groups/{id}        - delete an empty group
+  POST   /v1/budget-groups/{id}/members?tenant=  - assign/migrate a member
+                                                   (optimistically versioned)
+  DELETE /v1/budget-groups/members/{tenant}      - detach a member
+  GET    /v1/budget-groups/members/{tenant}/history - membership intervals
+  GET    /v1/budgets/{tenant}/resolved - effective policy with source and
+                                         version attribution (?at= history)
+  POST   /v1/budgets/{tenant}/overrides - request a time-windowed override
+  GET    /v1/budget-overrides           - list/filter override requests
+  GET    /v1/budget-overrides/{id}      - one override
+  POST   /v1/budget-overrides/{id}/approve | /reject | /revoke
+
+The resolution chain is: approved active override > tenant budget > group
+default (inherited through an acyclic parent chain). Group edits, member
+migrations and override approval/revocation take effect for the very next
+resolution; closed periods keep the frozen policy snapshot recorded for
+them. Groups and migrations require global budget:write; override requests
+and decisions require budget:write on the tenant, and a different
+administrator than the requester must decide.
 """
 from __future__ import annotations
 
@@ -105,12 +133,15 @@ from .config_store import (
 from .health import HealthChecker, HealthRegistry
 from .metering import (
     BudgetExceeded,
+    BudgetGroupSpec,
     BudgetSpec,
     MeteringConflict,
     MeteringNotFound,
     MeteringStore,
     MeteringValidationError,
+    OverrideSpec,
     PERIOD_TYPES,
+    PolicyDenied,
 )
 from .models import ConfigBundle
 from .rate_limit import RateLimitExceeded, RateLimiter
@@ -288,6 +319,44 @@ class AlertAckRequest(BaseModel):
     expected_version: Optional[int] = Field(default=None, ge=1)
 
 
+class BudgetGroupUpsertRequest(BaseModel):
+    description: str = ""
+    parent_id: Optional[str] = None
+    period_type: Optional[str] = None
+    amount: Optional[float] = Field(default=None, allow_inf_nan=False)
+    alert_thresholds: Optional[list[float]] = None
+    over_policy: Optional[str] = None
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
+class MemberMoveRequest(BaseModel):
+    group_id: Optional[str] = Field(
+        default=None, description="destination group; null/omit to detach"
+    )
+    expected_version: Optional[int] = Field(default=None, ge=0)
+
+
+class OverrideCreateRequest(BaseModel):
+    period_type: str = "day"
+    amount: float = Field(gt=0, allow_inf_nan=False)
+    alert_thresholds: list[float] = Field(
+        default_factory=lambda: [0.8, 1.0]
+    )
+    over_policy: str = "reject"
+    window_start: float = Field(allow_inf_nan=False)
+    window_end: float = Field(allow_inf_nan=False)
+    reason: str = ""
+
+
+class OverrideDecideRequest(BaseModel):
+    comment: Optional[str] = None
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
+class OverrideRevokeRequest(BaseModel):
+    expected_version: Optional[int] = Field(default=None, ge=1)
+
+
 class Components:
     def __init__(
         self,
@@ -441,6 +510,13 @@ def create_app(components: Components) -> FastAPI:
     @app.exception_handler(MeteringValidationError)
     async def _metering_validation(_req, exc: MeteringValidationError):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.exception_handler(PolicyDenied)
+    async def _policy_denied(_req, exc: PolicyDenied):
+        # Semantic refusals (cycles, expired overrides, cross-scope writes,
+        # self-approval, concurrent member migration) surface as 409; the
+        # store has already written the budget_policy_denied audit record.
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     async def authenticated(
         authorization: Optional[str] = Header(default=None),
@@ -1178,18 +1254,385 @@ def create_app(components: Components) -> FastAPI:
 
     @app.get("/v1/budgets/{tenant}")
     async def get_budget(
+        tenant: str,
+        at: Optional[float] = Query(
+            default=None,
+            description="resolve the policy chain as of this epoch time",
+        ),
+        caller: Caller = Depends(authenticated),
+    ):
+        comp.authz.authorize(
+            caller, "budget:read", [tenant_scope(tenant)]
+        )
+        status = comp.metering.budget_status(tenant, at=at)
+        if status is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no budget policy applies to tenant {tenant!r}"
+                + (f" at {at}" if at is not None else ""),
+            )
+        return status
+
+    # -- tenant budget groups, memberships and temporary overrides ----------
+
+    def require_global_budget_write(caller: Caller) -> None:
+        """Groups are cross-tenant resources: only global budget:write manages."""
+        grants = caller.grants("budget:write")
+        if caller.kind in ("bootstrap", "open"):
+            comp.authz.authorize(caller, "budget:write", [Scope()])
+            return
+        if not any(g.scope == "global" for g in grants):
+            # Audit the denial explicitly before refusing, like other
+            # cross-scope write attempts.
+            comp.authz.authorize(caller, "budget:write", [Scope()])
+
+    def filter_groups_for_caller(caller: Caller, groups: list[dict]) -> list[dict]:
+        if caller.kind in ("bootstrap", "open"):
+            return groups
+        memberships = comp.metering.list_memberships()
+        visible_groups: set[str] = set()
+        for m in memberships:
+            if any(
+                g.covers(tenant_scope(m["tenant"]))
+                for g in caller.grants("budget:read")
+            ):
+                visible_groups.add(m["group_id"])
+        return [g for g in groups if g["id"] in visible_groups]
+
+    @app.get("/v1/budget-groups")
+    async def list_budget_groups(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "budget:read")
+        groups = comp.metering.list_groups()
+        return {"groups": filter_groups_for_caller(caller, groups)}
+
+    @app.post("/v1/budget-groups", status_code=201)
+    async def create_budget_group(
+        req: BudgetGroupUpsertRequest,
+        request: Request,
+        group_id: str = Query(..., description="id of the new group"),
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        require_global_budget_write(caller)
+
+        def produce():
+            spec = BudgetGroupSpec(id=group_id, **req.model_dump())
+            group, created = comp.metering.upsert_group(
+                spec, actor=caller.identity_id
+            )
+            return 201, {"group": group, "created": created}
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"group_id": group_id, **req.model_dump()}, produce,
+        )
+
+    @app.get("/v1/budget-groups/{group_id}")
+    async def get_budget_group(
+        group_id: str, caller: Caller = Depends(authenticated)
+    ):
+        comp.authz.authorize(caller, "budget:read")
+        try:
+            group = comp.metering.get_group(group_id)
+        except MeteringNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        visible = filter_groups_for_caller(caller, [group])
+        if not visible and not caller.is_global:
+            raise HTTPException(
+                status_code=403,
+                detail="no covered tenant belongs to this group",
+            )
+        return {"group": visible[0] if visible else group}
+
+    @app.put("/v1/budget-groups/{group_id}")
+    async def put_budget_group(
+        group_id: str,
+        req: BudgetGroupUpsertRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        require_global_budget_write(caller)
+
+        def produce():
+            spec = BudgetGroupSpec(id=group_id, **req.model_dump())
+            group, created = comp.metering.upsert_group(
+                spec, actor=caller.identity_id
+            )
+            return (201 if created else 200), {
+                "group": group, "created": created
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"group_id": group_id, **req.model_dump()}, produce,
+        )
+
+    @app.delete("/v1/budget-groups/{group_id}")
+    async def delete_budget_group(
+        group_id: str,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        require_global_budget_write(caller)
+
+        def produce():
+            comp.metering.delete_group(group_id, actor=caller.identity_id)
+            return 200, {"deleted": group_id}
+
+        return run_idempotent(idempotency_key, request, caller, {}, produce)
+
+    @app.post("/v1/budget-groups/{group_id}/members", status_code=200)
+    async def add_group_members(
+        group_id: str,
+        req: MemberMoveRequest,
+        request: Request,
+        tenant: str = Query(..., description="tenant to assign or migrate"),
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        # Migrating a tenant rewrites a cross-tenant grouping resource: the
+        # caller must hold global budget:write AND coverage of the moved
+        # tenant, so a tenant-scoped admin can never reshuffle memberships.
+        require_global_budget_write(caller)
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(tenant)]
+        )
+
+        def produce():
+            membership, changed = comp.metering.move_member(
+                tenant,
+                group_id,
+                actor=caller.identity_id,
+                expected_version=req.expected_version,
+            )
+            return 200, {"membership": membership, "changed": changed}
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"group_id": group_id, "tenant": tenant, **req.model_dump()},
+            produce,
+        )
+
+    @app.delete("/v1/budget-groups/members/{tenant}")
+    async def remove_group_member(
+        tenant: str,
+        request: Request,
+        expected_version: Optional[int] = Query(default=None, ge=0),
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        require_global_budget_write(caller)
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(tenant)]
+        )
+
+        def produce():
+            membership, changed = comp.metering.remove_member(
+                tenant,
+                actor=caller.identity_id,
+                expected_version=expected_version,
+            )
+            return 200, {"membership": membership, "changed": changed}
+
+        return run_idempotent(idempotency_key, request, caller, {}, produce)
+
+    @app.get("/v1/budget-groups/members/{tenant}/history")
+    async def get_membership_history(
         tenant: str, caller: Caller = Depends(authenticated)
     ):
         comp.authz.authorize(
             caller, "budget:read", [tenant_scope(tenant)]
         )
-        status = comp.metering.budget_status(tenant)
-        if status is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"no budget configured for tenant {tenant!r}",
+        return {
+            "tenant": tenant,
+            "history": comp.metering.membership_history(tenant),
+        }
+
+    @app.get("/v1/budgets/{tenant}/resolved")
+    async def get_resolved_policy(
+        tenant: str,
+        at: Optional[float] = Query(default=None),
+        caller: Caller = Depends(authenticated),
+    ):
+        """Resolve and show the effective policy with source and version."""
+        comp.authz.authorize(
+            caller, "budget:read", [tenant_scope(tenant)]
+        )
+        policy = comp.metering.resolve_policy(tenant, at=at)
+        if policy is None:
+            return {
+                "tenant": tenant,
+                "enabled": False,
+                "policy": None,
+            }
+        out = policy.policy_dict()
+        out["tenant"] = tenant
+        out["enabled"] = True
+        out["origin"] = policy.origin()
+        out["resolved_at"] = policy.resolved_at
+        return out
+
+    @app.post("/v1/budgets/{tenant}/overrides", status_code=201)
+    async def create_override(
+        tenant: str,
+        req: OverrideCreateRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        # Filing a request for a tenant's policy needs budget:write on that
+        # tenant; the request grants nothing until a different admin approves.
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(tenant)]
+        )
+
+        def produce():
+            spec = OverrideSpec(**req.model_dump())
+            override = comp.metering.request_override(
+                spec, tenant=tenant, actor=caller.identity_id
             )
-        return status
+            return 201, {"override": override}
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"tenant": tenant, **req.model_dump()}, produce,
+        )
+
+    @app.get("/v1/budget-overrides")
+    async def list_overrides(
+        tenant: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        if tenant is not None:
+            comp.authz.authorize(
+                caller, "budget:read", [tenant_scope(tenant)]
+            )
+            overrides = comp.metering.list_overrides(
+                tenant=tenant, status=status, limit=limit
+            )
+        else:
+            comp.authz.authorize(caller, "budget:read")
+            overrides = comp.metering.list_overrides(
+                status=status, limit=limit
+            )
+            overrides = [
+                o for o in overrides
+                if tenant_visible(caller, "budget:read", o["tenant"])
+            ]
+        return {"overrides": overrides, "count": len(overrides)}
+
+    def _get_visible_override(caller: Caller, override_id: str) -> dict:
+        override = comp.metering.get_override(override_id)
+        comp.authz.authorize(
+            caller, "budget:read", [tenant_scope(override["tenant"])]
+        )
+        return override
+
+    @app.get("/v1/budget-overrides/{override_id}")
+    async def get_override(
+        override_id: str, caller: Caller = Depends(authenticated)
+    ):
+        return {"override": _get_visible_override(caller, override_id)}
+
+    def _decide_override(
+        override_id: str,
+        approve: bool,
+        req: OverrideDecideRequest,
+        request: Request,
+        caller: Caller,
+        idempotency_key: Optional[str],
+    ):
+        override = comp.metering.get_override(override_id)
+        # The approver must independently hold budget:write over the tenant;
+        # the store additionally refuses the original requester.
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(override["tenant"])]
+        )
+
+        def produce():
+            result = comp.metering.decide_override(
+                override_id,
+                approve,
+                actor=caller.identity_id,
+                comment=req.comment,
+                expected_version=req.expected_version,
+            )
+            return 200, {"override": result}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
+
+    @app.post("/v1/budget-overrides/{override_id}/approve")
+    async def approve_override(
+        override_id: str,
+        req: OverrideDecideRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        return _decide_override(
+            override_id, True, req, request, caller, idempotency_key
+        )
+
+    @app.post("/v1/budget-overrides/{override_id}/reject")
+    async def reject_override(
+        override_id: str,
+        req: OverrideDecideRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        return _decide_override(
+            override_id, False, req, request, caller, idempotency_key
+        )
+
+    @app.post("/v1/budget-overrides/{override_id}/revoke")
+    async def revoke_override(
+        override_id: str,
+        req: OverrideRevokeRequest,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        override = comp.metering.get_override(override_id)
+        comp.authz.authorize(
+            caller, "budget:write", [tenant_scope(override["tenant"])]
+        )
+
+        def produce():
+            result = comp.metering.revoke_override(
+                override_id,
+                actor=caller.identity_id,
+                expected_version=req.expected_version,
+            )
+            return 200, {"override": result}
+
+        return run_idempotent(
+            idempotency_key, request, caller, req.model_dump(), produce
+        )
 
     @app.put("/v1/budgets/{tenant}")
     async def put_budget(

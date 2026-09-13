@@ -125,9 +125,119 @@ CREATE TABLE IF NOT EXISTS budget_alerts (
     acknowledged_at REAL,
     comment      TEXT,
     version      INTEGER NOT NULL DEFAULT 1,
+    policy_origin TEXT,
     UNIQUE(tenant, period_type, period_start, threshold)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_tenant ON budget_alerts(tenant, status);
+
+-- Tenant budget groups: a group carries an optional default budget policy
+-- (period/amount/thresholds/over-policy). A group without its own policy
+-- inherits from parent_id; the chain is validated to be acyclic. Every
+-- policy/parent/description change bumps ``version``; each version is also
+-- archived in budget_group_revisions so historical periods can resolve the
+-- policy that was in effect at an arbitrary past time.
+CREATE TABLE IF NOT EXISTS budget_groups (
+    id               TEXT PRIMARY KEY,
+    description      TEXT NOT NULL DEFAULT '',
+    parent_id        TEXT,
+    period_type      TEXT,
+    amount           REAL,
+    alert_thresholds TEXT,
+    over_policy      TEXT,
+    version          INTEGER NOT NULL DEFAULT 1,
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    created_by       TEXT,
+    updated_by       TEXT
+);
+CREATE TABLE IF NOT EXISTS budget_group_revisions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id   TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    action     TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    actor      TEXT,
+    ts         REAL NOT NULL,
+    UNIQUE(group_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_group_rev_time
+    ON budget_group_revisions(group_id, ts);
+-- A tenant belongs to at most one group at a time. The per-row version is
+-- the optimistic-concurrency token for member migrations: a concurrent move
+-- of the same tenant loses with a conflict instead of silently overwriting.
+CREATE TABLE IF NOT EXISTS budget_group_members (
+    tenant     TEXT PRIMARY KEY,
+    group_id   TEXT NOT NULL,
+    version    INTEGER NOT NULL DEFAULT 1,
+    added_at   REAL NOT NULL,
+    added_by   TEXT,
+    FOREIGN KEY(group_id) REFERENCES budget_groups(id)
+);
+CREATE INDEX IF NOT EXISTS idx_group_members_group
+    ON budget_group_members(group_id);
+-- Append-only membership intervals; the open interval (end_at IS NULL) is
+-- the tenant's current group. Closed intervals let policy resolution for a
+-- past event time see which group the tenant belonged to back then.
+CREATE TABLE IF NOT EXISTS budget_group_membership_history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant    TEXT NOT NULL,
+    group_id  TEXT NOT NULL,
+    start_at  REAL NOT NULL,
+    end_at    REAL,
+    moved_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_membership_history
+    ON budget_group_membership_history(tenant, start_at);
+-- Approval-gated temporary budget overrides with an explicit validity
+-- window. Only an approved override whose window contains the resolution
+-- time is in effect; windows of two non-terminal overrides for one tenant
+-- may never overlap.
+CREATE TABLE IF NOT EXISTS budget_overrides (
+    id               TEXT PRIMARY KEY,
+    tenant           TEXT NOT NULL,
+    period_type      TEXT NOT NULL,
+    amount           REAL NOT NULL,
+    alert_thresholds TEXT NOT NULL,
+    over_policy      TEXT NOT NULL,
+    window_start     REAL NOT NULL,
+    window_end       REAL NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    requested_by     TEXT NOT NULL,
+    requested_at     REAL NOT NULL,
+    decided_by       TEXT,
+    decided_at       REAL,
+    decision_comment TEXT,
+    approved_at      REAL,
+    revoked_by       TEXT,
+    revoked_at       REAL,
+    version          INTEGER NOT NULL DEFAULT 1,
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_overrides_tenant
+    ON budget_overrides(tenant, status, window_start);
+-- Frozen policy actually applied per (tenant, period). The open period's
+-- row tracks the live resolved policy (frozen=0) and is refreshed on every
+-- event; the first observation after the period closes re-resolves the
+-- policy as of the period boundary and flips the row to frozen=1, after
+-- which it never changes again.
+CREATE TABLE IF NOT EXISTS budget_policy_snapshots (
+    period_type      TEXT NOT NULL,
+    period_start     REAL NOT NULL,
+    tenant           TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    source_id        TEXT NOT NULL,
+    source_version   INTEGER NOT NULL,
+    amount           REAL NOT NULL,
+    alert_thresholds TEXT NOT NULL,
+    over_policy      TEXT NOT NULL,
+    frozen           INTEGER NOT NULL DEFAULT 0,
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    PRIMARY KEY (period_type, period_start, tenant)
+);
+CREATE INDEX IF NOT EXISTS idx_policy_snapshots_tenant
+    ON budget_policy_snapshots(tenant, period_start);
 """
 
 
@@ -140,4 +250,7 @@ def connect(db_path: str) -> sqlite3.Connection:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(config_versions)")}
     if "summary" not in cols:
         conn.execute("ALTER TABLE config_versions ADD COLUMN summary TEXT")
+    alert_cols = {r["name"] for r in conn.execute("PRAGMA table_info(budget_alerts)")}
+    if "policy_origin" not in alert_cols:
+        conn.execute("ALTER TABLE budget_alerts ADD COLUMN policy_origin TEXT")
     return conn

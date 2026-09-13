@@ -243,7 +243,9 @@ class Resolver:
         # is one unit; only tenants with a configured budget are gated.
         budget_decision: Optional[BudgetDecision] = None
         if self._metering is not None and tenant:
-            budget_decision = self._metering.check(tenant, now=now)
+            budget_decision = self._metering.check(
+                tenant, now=now, audit_resolution=True
+            )
             if not budget_decision.allowed:
                 stored = self._record_usage(
                     tenant, key, name, region, sig, snap,
