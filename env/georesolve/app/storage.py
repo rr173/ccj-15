@@ -598,6 +598,129 @@ CREATE TABLE IF NOT EXISTS plan_run_comparisons (
 );
 CREATE INDEX IF NOT EXISTS idx_plan_comparisons_pair
     ON plan_run_comparisons(run_id_low, run_id_high);
+
+-- ======================================================================
+-- Target health-check orchestration
+--
+-- Each resolution target can have an independent check policy: several
+-- probe methods, interval/timeout, failure and recovery thresholds,
+-- maintenance windows and a priority for the checker. Policies are
+-- versioned (monotonic ``policy_version``, optimistic-concurrency token);
+-- every create/update/delete appends an immutable revision row, and
+-- recorded check history is never rewritten when a policy changes.
+--
+-- The per-target state machine lives in health_target_states: observed
+-- check verdict with unfinished threshold counters, current effective
+-- status plus its explicit source (check/manual_override/maintenance/
+-- paused/unmanaged), pause and override (with expiry) bookkeeping, next
+-- scheduled probe time and a separate state_version. Everything needed to
+-- continue after a restart is here; health_check_history is append-only.
+-- ======================================================================
+CREATE TABLE IF NOT EXISTS health_policies (
+    target_id      TEXT PRIMARY KEY,
+    policy_version INTEGER NOT NULL,
+    checks         TEXT NOT NULL,          -- ordered list of probe method specs
+    interval_seconds REAL NOT NULL,
+    timeout_seconds  REAL NOT NULL,
+    fail_threshold  INTEGER NOT NULL,
+    recover_threshold INTEGER NOT NULL,
+    maintenance_windows TEXT NOT NULL,     -- list of [start, end, note]
+    priority       INTEGER NOT NULL DEFAULT 100,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL,
+    created_by     TEXT,
+    updated_by     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_health_policies_priority
+    ON health_policies(enabled, priority);
+
+-- Append-only policy revisions: history of policy content. The frozen
+-- payload of a revision is what check history rows refer to via
+-- policy_version; later edits only append a new revision.
+CREATE TABLE IF NOT EXISTS health_policy_revisions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id      TEXT NOT NULL,
+    policy_version INTEGER NOT NULL,
+    action         TEXT NOT NULL,          -- created|updated|deleted
+    payload        TEXT NOT NULL,
+    actor          TEXT,
+    ts             REAL NOT NULL,
+    UNIQUE(target_id, policy_version)
+);
+CREATE INDEX IF NOT EXISTS idx_health_policy_rev_target
+    ON health_policy_revisions(target_id, policy_version);
+CREATE INDEX IF NOT EXISTS idx_health_policy_rev_version
+    ON health_policy_revisions(policy_version);
+
+-- Per-target live state machine row, persisted after every change so the
+-- observed verdict, unfinished threshold counters, maintenance/override
+-- timing and scheduling all survive a restart.
+CREATE TABLE IF NOT EXISTS health_target_states (
+    target_id        TEXT PRIMARY KEY,
+    observed_healthy INTEGER NOT NULL DEFAULT 1,  -- verdict from checks
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    consecutive_successes INTEGER NOT NULL DEFAULT 0,
+    effective_source TEXT NOT NULL DEFAULT 'unmanaged',
+    effective_healthy INTEGER NOT NULL DEFAULT 1,
+    paused           INTEGER NOT NULL DEFAULT 0,
+    paused_at        REAL,
+    paused_reason    TEXT,
+    pause_resets_counters INTEGER NOT NULL DEFAULT 1,
+    override_healthy INTEGER,
+    override_reason  TEXT,
+    override_by      TEXT,
+    override_at      REAL,
+    override_expires_at REAL,
+    policy_version   INTEGER NOT NULL DEFAULT 0,  -- policy at last check
+    last_check_seq   INTEGER NOT NULL DEFAULT 0,
+    last_checked_at  REAL,
+    next_check_at    REAL NOT NULL,
+    state_version    INTEGER NOT NULL DEFAULT 1,
+    in_maintenance   INTEGER NOT NULL DEFAULT 0,
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_health_states_due
+    ON health_target_states(next_check_at);
+
+-- Append-only check/transition history in a fixed global order. Each row
+-- records either a probe evaluation (kind='check': start time, per-method
+-- response summaries, verdict, reason, policy version) or an effective
+-- status transition (kind='transition': reason, old/new status and source,
+-- and policy/state versions before and after). Rows are immutable; a policy
+-- update never rewrites them.
+CREATE TABLE IF NOT EXISTS health_check_history (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,  -- global fixed order
+    target_id      TEXT NOT NULL,
+    seq            INTEGER NOT NULL,          -- per-target 1-based order
+    kind           TEXT NOT NULL,             -- check|transition
+    ts             REAL NOT NULL,             -- record time
+    started_at     REAL,                      -- check: probe start time
+    policy_version INTEGER NOT NULL,          -- governing policy version
+    state_version  INTEGER,                   -- state version after the event
+    verdict        TEXT,                      -- check: success|failure|skipped
+    failure_reason TEXT,                      -- timeout|response_format_error|...
+    response_summary TEXT,                    -- per-method compact summaries
+    duration_ms    REAL,
+    effective_healthy INTEGER,
+    effective_source TEXT,
+    transition_reason TEXT,                  -- transition: check_fail_threshold|...
+    from_healthy   INTEGER,
+    to_healthy     INTEGER,
+    from_source    TEXT,
+    to_source      TEXT,
+    from_policy_version INTEGER,
+    to_policy_version INTEGER,
+    actor          TEXT,
+    detail         TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_health_hist_target
+    ON health_check_history(target_id, seq);
+CREATE INDEX IF NOT EXISTS idx_health_hist_version
+    ON health_check_history(policy_version);
+CREATE INDEX IF NOT EXISTS idx_health_hist_ts
+    ON health_check_history(ts, id);
 """
 
 

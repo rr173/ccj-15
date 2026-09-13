@@ -506,6 +506,87 @@
 | `POST /v1/drill-runs/{id}/compare` | 固定两运行版本的只读比较报告（每对唯一，带 checksum） |
 | `GET /v1/drill-plans-audit?plan_id=&run_id=&action=&since=&limit=` | 计划/运行独立审计 |
 
+## 目标健康检查编排（health checks）
+
+在原有内存健康视图之上，新增**每目标独立、全持久化**的检查编排。管理员可为每个
+被规则/发布组引用的目标配置自己的检查策略；解析选择只读取当前有效健康状态。
+
+### 策略与配置版本
+- `PUT /v1/health/targets/{id}/policy` 创建/更新策略（201/200），字段：
+  `checks`（多种检查方式，缺省按目标地址推导一个 tcp/http 探测）、
+  `interval_seconds`、`timeout_seconds`、`fail_threshold`、
+  `recover_threshold`、`maintenance_windows[]`（`[start,end,note)`）、
+  `priority`（调度顺序，数值小者先）、`enabled`，以及乐观锁 `expected_version`。
+- 每次创建/更新/删除都自增 `policy_version` 并向 `health_policy_revisions`
+  **追加不可变修订**；删除保留修订与历史。`GET /v1/health/policy-revisions`
+  可按 `target_id` 查询；同内容 PUT 是无变化 no-op。
+- 检查方式 `checks[]`：`tcp`（可覆盖端口/超时）与 `http/https`（可覆盖端口、
+  `path`、单次 `timeout_seconds`、`expect_status`、`expect_json`、
+  `expect_field:{path,equals}`、`content_regex`）。一轮检查的多个方式为
+  AND（全部成功才算成功）。TCP 探测只允许端口/超时设置。
+- 明确拒绝：未知目标（404）、非正间隔/超时、阈值 <1、`end<=start` 的窗口、
+  非法正则、TCP 携带 HTTP 期望、非有限数（422）；`expected_version` 与当前
+  `policy_version` 不符返回 409，**旧版本不能覆盖新状态**。
+
+### 每目标独立状态机
+- 观察判定（observed）只在连续失败达到 `fail_threshold` 时翻为不健康、连续
+  成功达到 `recover_threshold` 时恢复；一次成功清零失败计数。阈值计数按目标
+  独立持久化，重启后未完成的计数继续累计。
+- **有效健康状态**（解析实际使用）有明确来源，优先级为
+  `manual_override > paused > maintenance > check > unmanaged`：
+  - `manual_override`：手工强制，可带 `expires_at`；覆盖期间检查照常进行并
+    累计阈值，但不能改变有效答案；撤销或到期后**自动回到当时的检查判定**；
+  - `paused`：暂停检查并冻结暂停瞬间的答案；
+  - `maintenance`：维护窗口内不探测，目标被摘出选择（有效不健康）；未来窗口
+    会把下次探测排到窗口起点，到点惰性进入、过点惰性恢复并立即重新调度；
+  - `check`：阈值后的观察判定；
+  - `unmanaged`：无策略，未知目标 fail-open（健康）。
+- 超时、连接错误、非 2xx/3xx、**响应格式错误**（坏状态行/非 JSON/字段不符）、
+  正文不匹配分别有明确 failure reason。
+
+### 检查历史（只追加、固定顺序、按版本筛选）
+- 每次检查记录 `kind=check`：开始时间 `started_at`、逐方式 `response_summary`、
+  判定 `verdict`、`failure_reason`、耗时、当时的阈值计数与**生效策略版本**；
+  每次有效状态变化记录 `kind=transition`：原因（阈值翻转/覆盖/覆盖到期/暂停/
+  恢复/维护起止/删除策略）、前后健康与来源、前后策略版本、状态版本、操作人。
+- 历史按目标 `seq` **升序固定分页**（`limit` + `after_seq` 游标，
+  `has_more`/`next_cursor`），支持 `policy_version`、`kind`、`since/until`。
+- **策略变更不重写历史**：旧检查行保留旧版本号与旧阈值细节，版本筛选永远
+  只返回该版本下的记录。
+
+### 暂停/恢复/手工覆盖与并发
+- `POST .../pause`、`.../resume`、`.../override`（`healthy/reason/expires_at`）、
+  `.../override/revoke`、`.../check`（立即跑一轮）。状态行带独立单调
+  `state_version`，这些接口都支持 `expected_version`（针对 state_version）
+  与 `Idempotency-Key`：重复键重放原响应（`idempotent_replay:true`，不重复
+  写版本/审计/历史），同键不同载荷 409。暂停/恢复天然幂等（`changed:false`）。
+- 旧的 `POST /v1/health/targets/{id}`（`{"healthy":bool}`）保留，等价于
+  无到期时间的手工覆盖；`GET /v1/health/targets/{id}` 返回完整状态
+  （来源、计数、暂停/覆盖/维护信息、两个版本号、下次检查时间）。
+- 探测在锁外并发执行；结果回写时校验策略版本与状态版本，**在途探测若遇到
+  策略变更或控制操作会被丢弃**，旧结果永不写入新状态。
+
+### 持久化、调度与演练隔离
+- 策略、修订、状态机（观察判定、未完成计数、有效来源、暂停、覆盖及到期时间、
+  维护窗口标记、下次检查时间）与全部历史落 SQLite；重启后状态、计数、窗口、
+  覆盖到期与历史顺序全部保持。后台调度器按 `priority,target_id` 顺序对到期
+  目标独立执行一轮检查。
+- 故障演练继续使用**私有健康注册表**：模拟失败绝不写入
+  `health_check_history`，线上检查/覆盖也不改变演练已冻结的步骤结果与报告
+  校验值；两个方向严格隔离。
+
+| 方法/路径 | 说明 |
+|---|---|
+| `GET /v1/health/targets` | 当前有效健康视图（含来源/版本，按 `health:read` 作用域过滤） |
+| `GET /v1/health/targets/{id}` | 单目标完整状态（无策略时为 unmanaged/fail-open） |
+| `GET /v1/health/policies` / `PUT .../policy` / `DELETE .../policy?expected_version=` | 策略列表/创建更新（幂等、版本乐观锁）/删除 |
+| `GET /v1/health/policy-revisions?target_id=` | 不可变策略修订流 |
+| `GET /v1/health/targets/{id}/history?policy_version=&kind=&since=&until=&after_seq=&limit=` | 固定升序分页的检查/转换历史 |
+| `POST /v1/health/targets/{id}/override` / `.../override/revoke` | 手工覆盖（可到期）/撤销（expected_version、幂等键） |
+| `POST /v1/health/targets/{id}/pause` / `.../resume` | 暂停（冻结答案）/恢复检查 |
+| `POST /v1/health/targets/{id}/check` | 立即执行一轮检查（维护/暂停时返回 `ran:false` 与原因） |
+| `POST /v1/health/targets/{id}` | 兼容旧接口：等价于无到期手工覆盖 |
+
 ## API
 
 数据面（无需认证）：

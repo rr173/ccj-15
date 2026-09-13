@@ -26,8 +26,24 @@ Control plane (authenticated; see app.authz for the delegation model):
   POST /v1/config/rollback/preview - dry-run a rollback (global scope only)
   GET  /v1/audit               - audit records, filtered to the caller's
                                  audit:read scope (plus records about itself)
-  GET  /v1/health/targets      - target health view, filtered by health:read
-  POST /v1/health/targets/{id} - manual health override (health:write; audited)
+  GET  /v1/health/targets              - effective target health view
+                                         (source + versions; scope-filtered)
+  GET  /v1/health/targets/{id}         - full per-target state machine state
+  GET  /v1/health/policies             - list check policies
+  PUT  /v1/health/targets/{id}/policy  - create/update a check policy
+                                         (methods, interval/timeout,
+                                         thresholds, maintenance windows,
+                                         priority; expected_version)
+  DELETE /v1/health/targets/{id}/policy - delete a policy (?expected_version=)
+  GET  /v1/health/policy-revisions     - immutable policy revision stream
+  GET  /v1/health/targets/{id}/history - append-only check/transition history
+                                         (fixed seq:asc paging; filter by
+                                         policy_version/kind/time window)
+  POST /v1/health/targets/{id}/override[/revoke] - manual override (optional
+                                         expiry) / release it
+  POST /v1/health/targets/{id}/pause|/resume - suspend checking / resume
+  POST /v1/health/targets/{id}/check   - run one check round immediately
+  POST /v1/health/targets/{id}         - legacy override (permanent)
   GET  /v1/cache               - cache contents, filtered by cache:read
   POST /v1/cache/flush         - drop cached answers inside the caller's
                                  cache:flush scope (audited)
@@ -201,6 +217,18 @@ from .drills import (
     TransitionIn,
 )
 from .health import HealthChecker, HealthRegistry
+from .health_checks import (
+    HealthCheckConflict,
+    HealthCheckNotFound,
+    HealthCheckStore,
+    HealthCheckValidation,
+    HealthScheduler,
+    OverrideIn,
+    OverrideRevokeIn,
+    PauseIn,
+    PolicyUpsertIn,
+    ResumeIn,
+)
 from .metering import (
     BudgetExceeded,
     BudgetGroupSpec,
@@ -469,7 +497,14 @@ class Components:
         self.authz = AuthzStore(db, self.audit, admin_token=admin_token)
         self.config = ConfigManager(db, self.audit, preview_ttl=preview_ttl)
         self.cache = ResolutionCache(time.time)
-        self.health = HealthRegistry()
+        # The health-check orchestrator owns the live effective health view
+        # (per-target policies, thresholded state machines, overrides,
+        # maintenance windows and append-only history, all SQLite-backed).
+        self.health = HealthCheckStore(db, self.config, self.audit, time.time)
+        self.health_scheduler = HealthScheduler(self.health)
+        # The plain in-memory registry and the global-interval checker are
+        # retained for standalone/library use and existing unit tests.
+        self.health_registry = HealthRegistry()
         self.rate_limiter = RateLimiter(self.audit, time.time)
         self.metering = MeteringStore(db, self.audit, time.time)
         self.disputes = DisputeStore(db, self.metering, self.audit, time.time)
@@ -488,7 +523,7 @@ class Components:
             self.metering,
         )
         self.checker = HealthChecker(
-            self.health,
+            self.health_registry,
             self.config,
             self.audit,
             interval=health_interval,
@@ -533,7 +568,7 @@ class Components:
         if not self.enable_background:
             return
         self._stop = asyncio.Event()
-        self._tasks.append(asyncio.create_task(self.checker.run(self._stop)))
+        self._tasks.append(asyncio.create_task(self.health_scheduler.run(self._stop)))
         if self.config_file:
             self._tasks.append(asyncio.create_task(self._watch_config_file(self._stop)))
 
@@ -664,6 +699,27 @@ def create_app(components: Components) -> FastAPI:
         # self-approval, concurrent member migration) surface as 409; the
         # store has already written the budget_policy_denied audit record.
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(HealthCheckNotFound)
+    async def _health_check_not_found(_req, exc: HealthCheckNotFound):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(HealthCheckConflict)
+    async def _health_check_conflict(_req, exc: HealthCheckConflict):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(HealthCheckValidation)
+    async def _health_check_validation(_req, exc: HealthCheckValidation):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
 
     async def authenticated(
         authorization: Optional[str] = Header(default=None),
@@ -1140,6 +1196,61 @@ def create_app(components: Components) -> FastAPI:
             records = [r for r in records if audit_visible(caller, grants, r)]
         return {"records": records}
 
+    # -- health-check orchestration -----------------------------------------
+
+    def health_target_refs(target_id: str):
+        """Every rule/group referencing a target; 404 when it is unknown."""
+        snap = comp.config.snapshot()
+        refs = [
+            item
+            for item in (*snap.all_rules(), *snap.all_release_groups())
+            if any(t.id == target_id for t in item.targets)
+        ]
+        if not refs:
+            raise HTTPException(
+                status_code=404, detail=f"unknown target {target_id!r}"
+            )
+        return refs
+
+    def authorize_health_read(caller: Caller, target_id: str):
+        refs = health_target_refs(target_id)
+        comp.authz.authorize(caller, "health:read", [item_scope(i) for i in refs])
+        return refs
+
+    def authorize_health_write(caller: Caller, target_id: str):
+        refs = health_target_refs(target_id)
+        comp.authz.authorize(caller, "health:write", [item_scope(i) for i in refs])
+        return refs
+
+    def _state_view(st: dict) -> dict:
+        return {
+            "target_id": st["target_id"],
+            "healthy": st["effective_healthy"],
+            "source": st["effective_source"],
+            "observed_healthy": st["observed_healthy"],
+            "paused": st["paused"],
+            "paused_at": st["paused_at"],
+            "paused_reason": st["paused_reason"],
+            "in_maintenance": st["in_maintenance"],
+            "override": (
+                None
+                if st["override_healthy"] is None
+                else {
+                    "healthy": st["override_healthy"],
+                    "reason": st["override_reason"],
+                    "by": st["override_by"],
+                    "at": st["override_at"],
+                    "expires_at": st["override_expires_at"],
+                }
+            ),
+            "consecutive_failures": st["consecutive_failures"],
+            "consecutive_successes": st["consecutive_successes"],
+            "policy_version": st["policy_version"],
+            "state_version": st["state_version"],
+            "last_checked_at": st["last_checked_at"],
+            "next_check_at": st["next_check_at"],
+        }
+
     @app.get("/v1/health/targets")
     async def get_health(caller: Caller = Depends(authenticated)):
         comp.authz.authorize(caller, "health:read")
@@ -1156,41 +1267,297 @@ def create_app(components: Components) -> FastAPI:
             view = {tid: st for tid, st in view.items() if tid in visible_ids}
         return {"targets": view}
 
+    @app.get("/v1/health/policies")
+    async def list_health_policies(caller: Caller = Depends(authenticated)):
+        comp.authz.authorize(caller, "health:read")
+        policies = comp.health.list_policies()
+        if not full_access(caller, "health:read"):
+            grants = caller.grants("health:read")
+            policies = [
+                p for p in policies
+                if all(
+                    any(g.covers(item_scope(i)) for g in grants)
+                    for i in health_target_refs(p["target_id"])
+                )
+            ]
+        return {"policies": policies, "count": len(policies)}
+
+    @app.get("/v1/health/targets/{target_id}")
+    async def get_target_state(
+        target_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_health_read(caller, target_id)
+        try:
+            st = comp.health.get_state(target_id)
+        except HealthCheckNotFound:
+            # A referenced target without any state yet is unmanaged/healthy.
+            health_target_refs(target_id)
+            return {
+                "state": {
+                    "target_id": target_id,
+                    "healthy": True,
+                    "source": "unmanaged",
+                    "policy_version": 0,
+                    "state_version": None,
+                }
+            }
+        return {"state": _state_view(st)}
+
+    @app.put("/v1/health/targets/{target_id}/policy")
+    async def put_health_policy(
+        target_id: str,
+        req: PolicyUpsertIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_health_write(caller, target_id)
+
+        def produce():
+            policy, created = comp.health.upsert_policy(
+                target_id, req, actor=caller.identity_id
+            )
+            return (201 if created else 200), {
+                "policy": policy,
+                "created": created,
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"target_id": target_id, **req.model_dump()}, produce,
+        )
+
+    @app.delete("/v1/health/targets/{target_id}/policy")
+    async def delete_health_policy(
+        target_id: str,
+        request: Request,
+        expected_version: Optional[int] = Query(default=None, ge=0),
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_health_write(caller, target_id)
+
+        def produce():
+            comp.health.delete_policy(
+                target_id,
+                expected_version=expected_version,
+                actor=caller.identity_id,
+            )
+            return 200, {"deleted": target_id}
+
+        return run_idempotent(idempotency_key, request, caller, {}, produce)
+
+    @app.get("/v1/health/targets/{target_id}/history")
+    async def get_health_history(
+        target_id: str,
+        policy_version: Optional[int] = Query(default=None, ge=1),
+        kind: Optional[str] = Query(default=None),
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        after_seq: Optional[int] = Query(default=None, ge=0),
+        limit: int = Query(default=100, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_health_read(caller, target_id)
+        if since is not None and until is not None and until < since:
+            raise HTTPException(status_code=400, detail="until before since")
+        return comp.health.history(
+            target_id,
+            policy_version=policy_version,
+            kind=kind,
+            since=since,
+            until=until,
+            after_seq=after_seq,
+            limit=limit,
+        )
+
+    @app.get("/v1/health/policy-revisions")
+    async def get_policy_revisions(
+        target_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        comp.authz.authorize(caller, "health:read")
+        if target_id is not None:
+            authorize_health_read(caller, target_id)
+        revisions = comp.health.revisions(target_id, limit=limit)
+        if target_id is None and not full_access(caller, "health:read"):
+            grants = caller.grants("health:read")
+            visible = []
+            for rev in revisions:
+                try:
+                    refs = health_target_refs(rev["target_id"])
+                except HTTPException:
+                    continue
+                if all(
+                    any(g.covers(item_scope(i)) for g in grants) for i in refs
+                ):
+                    visible.append(rev)
+            revisions = visible
+        return {"revisions": revisions, "count": len(revisions)}
+
+    @app.post("/v1/health/targets/{target_id}/override")
+    async def post_health_override(
+        target_id: str,
+        req: OverrideIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_health_write(caller, target_id)
+
+        def produce():
+            result = comp.health.override(
+                target_id, req, actor=caller.identity_id
+            )
+            return 200, {
+                "changed": result["changed"],
+                "state": _state_view(result["state"]),
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"target_id": target_id, **req.model_dump()}, produce,
+        )
+
+    @app.post("/v1/health/targets/{target_id}/override/revoke")
+    async def revoke_health_override(
+        target_id: str,
+        req: OverrideRevokeIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_health_write(caller, target_id)
+
+        def produce():
+            result = comp.health.revoke_override(
+                target_id,
+                expected_version=req.expected_version,
+                actor=caller.identity_id,
+            )
+            return 200, {
+                "changed": result["changed"],
+                "state": _state_view(result["state"]),
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"target_id": target_id, **req.model_dump()}, produce,
+        )
+
+    @app.post("/v1/health/targets/{target_id}/pause")
+    async def pause_health_target(
+        target_id: str,
+        req: PauseIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_health_write(caller, target_id)
+
+        def produce():
+            result = comp.health.pause(
+                target_id,
+                reason=req.reason,
+                expected_version=req.expected_version,
+                actor=caller.identity_id,
+            )
+            return 200, {
+                "changed": result["changed"],
+                "state": _state_view(result["state"]),
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"target_id": target_id, **req.model_dump()}, produce,
+        )
+
+    @app.post("/v1/health/targets/{target_id}/resume")
+    async def resume_health_target(
+        target_id: str,
+        req: ResumeIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_health_write(caller, target_id)
+
+        def produce():
+            result = comp.health.resume(
+                target_id,
+                expected_version=req.expected_version,
+                actor=caller.identity_id,
+            )
+            return 200, {
+                "changed": result["changed"],
+                "state": _state_view(result["state"]),
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller,
+            {"target_id": target_id, **req.model_dump()}, produce,
+        )
+
+    @app.post("/v1/health/targets/{target_id}/check")
+    async def run_health_check(
+        target_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_health_write(caller, target_id)
+        # Make sure the target has a policy; a 404/409 from the store maps via
+        # the exception handlers. This endpoint forces one immediate round.
+        comp.health.get_policy(target_id)
+        result = await comp.health.check_target(target_id)
+        if result is None:
+            st = comp.health.get_state(target_id)
+            return {"ran": False, "reason": st["effective_source"],
+                    "state": _state_view(st)}
+        return {"ran": True, "check": result}
+
     @app.post("/v1/health/targets/{target_id}")
     async def override_health(
         target_id: str,
         req: HealthOverrideRequest,
+        request: Request,
         caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
     ):
-        # The override is allowed only when every rule/group referencing the
-        # target is inside the caller's scope; otherwise the write would
-        # leak side effects into someone else's configuration.
-        snap = comp.config.snapshot()
-        refs = [
-            item
-            for item in (*snap.all_rules(), *snap.all_release_groups())
-            if any(t.id == target_id for t in item.targets)
-        ]
-        if not refs:
-            raise HTTPException(
-                status_code=404, detail=f"unknown target {target_id!r}"
+        # Legacy manual override endpoint: backed by the new orchestrator as a
+        # permanent (no-expiry) manual override. Authorization requires every
+        # referencing rule/group to be inside the caller's scope.
+        authorize_health_write(caller, target_id)
+        body = {"healthy": req.healthy}
+
+        def produce():
+            result = comp.health.override(
+                target_id,
+                OverrideIn(healthy=req.healthy),
+                actor=caller.identity_id,
             )
-        comp.authz.authorize(
-            caller, "health:write", [item_scope(i) for i in refs]
-        )
-        old = comp.health.is_healthy(target_id)
-        comp.health.set(target_id, req.healthy)
-        comp.audit.record(
-            "health_change",
-            {
+            return 200, {
                 "target_id": target_id,
-                "old": old,
-                "new": req.healthy,
-                "source": "admin",
-                "identity": caller.identity_id,
-            },
+                "healthy": req.healthy,
+                "changed": result["changed"],
+                "state_version": result["state"]["state_version"],
+            }
+
+        return run_idempotent(
+            idempotency_key, request, caller, body, produce
         )
-        return {"target_id": target_id, "healthy": req.healthy}
 
     @app.get("/v1/cache")
     async def get_cache(caller: Caller = Depends(authenticated)):
