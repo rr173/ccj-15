@@ -843,6 +843,169 @@ CREATE TABLE IF NOT EXISTS health_alert_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- ======================================================================
+-- Alert policy drills (isolated alert-pipeline replay)
+--
+-- An alert drill freezes ONE subscription revision plus a fixed, ordered
+-- slice of real health history rows, then replays the production alert
+-- semantics (target/source matching, consecutive-threshold confirmation,
+-- silence suppression, exponential-backoff retries) against a PRIVATE
+-- simulated clock and a PRIVATE outbox. Nothing here ever writes
+-- health_check_history, health_alert_events, health_alert_deliveries or a
+-- live health state: the only tables touched are the alert_drill_* ones,
+-- and every "webhook" is appended to alert_drill_inbox (queryable, never
+-- delivered over the network). All state is persisted, so a replay resumes
+-- unchanged after a restart.
+--
+-- Lifecycle mirrors the resolution fault drills:
+--   ready -> running <-> paused -> completed; reset starts a new run epoch
+--   (old rows are kept tagged with the prior epoch for the audit trail).
+-- version is the drill's optimistic-concurrency token (expected_version
+-- mismatch -> 409); idempotency keys are scoped to (drill, run_epoch).
+-- ======================================================================
+CREATE TABLE IF NOT EXISTS alert_drills (
+    id           TEXT PRIMARY KEY,
+    status       TEXT NOT NULL,             -- ready|running|paused|completed
+    run_epoch    INTEGER NOT NULL DEFAULT 1,
+    version      INTEGER NOT NULL DEFAULT 1,
+    sub_id       TEXT NOT NULL,
+    sub_version  INTEGER NOT NULL,          -- frozen subscription revision
+    input        TEXT NOT NULL,             -- frozen input snapshot (see module)
+    cursor       INTEGER NOT NULL DEFAULT 0,-- last consumed history id
+    total_rows   INTEGER NOT NULL,          -- frozen history rows in the replay
+    sim_clock    REAL,                      -- current simulated time
+    base_sim_time REAL NOT NULL,            -- clock anchor at creation
+    stats        TEXT NOT NULL,             -- running aggregate stats JSON
+    description  TEXT NOT NULL DEFAULT '',
+    created_by   TEXT,
+    created_at   REAL NOT NULL,
+    started_at   REAL,
+    paused_at    REAL,
+    completed_at REAL,
+    updated_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_drills_status ON alert_drills(status);
+CREATE INDEX IF NOT EXISTS idx_alert_drills_created ON alert_drills(created_at, id);
+
+-- One row per advance: kind='event' consumed one frozen history row;
+-- kind='clock' only moved the simulated clock (let retries mature).
+CREATE TABLE IF NOT EXISTS alert_drill_steps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    drill_id    TEXT NOT NULL,
+    run_epoch   INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,          -- per-(drill, epoch) 1-based order
+    kind        TEXT NOT NULL,             -- event|clock
+    history_id  INTEGER,                   -- event: consumed history row
+    sim_time    REAL NOT NULL,
+    recorded_at REAL NOT NULL,
+    actor       TEXT,
+    result      TEXT NOT NULL,             -- full decision record JSON
+    UNIQUE(drill_id, run_epoch, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_alert_drill_steps
+    ON alert_drill_steps(drill_id, run_epoch, seq);
+
+-- Replayed alert events (the private mirror of health_alert_events).
+CREATE TABLE IF NOT EXISTS alert_drill_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    drill_id     TEXT NOT NULL,
+    run_epoch    INTEGER NOT NULL,
+    event_uid    TEXT NOT NULL,
+    history_id   INTEGER NOT NULL,
+    target_id    TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    ts           REAL NOT NULL,
+    status       TEXT NOT NULL,
+    confirm_count INTEGER NOT NULL DEFAULT 0,
+    threshold    INTEGER NOT NULL,
+    activated_at REAL,
+    detail       TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(drill_id, run_epoch, history_id)
+);
+CREATE INDEX IF NOT EXISTS idx_alert_drill_events
+    ON alert_drill_events(drill_id, run_epoch);
+
+-- The private delivery outbox. Mirrors the production lifecycle states;
+-- the signing secret is frozen here at event-matching time exactly like
+-- production and never exposed on the read API.
+CREATE TABLE IF NOT EXISTS alert_drill_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    drill_id        TEXT NOT NULL,
+    run_epoch       INTEGER NOT NULL,
+    delivery_uid    TEXT NOT NULL,
+    event_id        INTEGER NOT NULL,
+    snapshot        TEXT NOT NULL,         -- frozen subscription payload
+    signing_secret  TEXT,
+    event_payload   TEXT NOT NULL,        -- frozen webhook body
+    status          TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    max_retries     INTEGER NOT NULL,
+    next_attempt_at REAL,
+    suppress_until  REAL,                  -- parked silence-window end
+    last_error      TEXT,
+    last_status_code INTEGER,
+    sent_at         REAL,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    UNIQUE(drill_id, run_epoch, delivery_uid)
+);
+CREATE INDEX IF NOT EXISTS idx_alert_drill_deliveries
+    ON alert_drill_deliveries(drill_id, run_epoch, status);
+
+-- Simulated webhook inbox: one row per attempted HTTP POST. No network I/O
+-- ever happens for a drill; this queue is queryable through the API.
+CREATE TABLE IF NOT EXISTS alert_drill_inbox (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    drill_id     TEXT NOT NULL,
+    run_epoch    INTEGER NOT NULL,
+    delivery_id  INTEGER NOT NULL,
+    attempt      INTEGER NOT NULL,
+    url          TEXT NOT NULL,
+    headers      TEXT NOT NULL,
+    body         TEXT NOT NULL,
+    delivered_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_drill_inbox
+    ON alert_drill_inbox(drill_id, run_epoch, id);
+
+-- Append-only audit trail, fully separate from the real audit table.
+CREATE TABLE IF NOT EXISTS alert_drill_audit (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    drill_id TEXT,
+    ts       REAL NOT NULL,
+    actor    TEXT,
+    action   TEXT NOT NULL,
+    version  INTEGER,
+    details  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_alert_drill_audit
+    ON alert_drill_audit(drill_id, id);
+
+-- Idempotency keys scoped per (drill, run epoch), like fault drills.
+CREATE TABLE IF NOT EXISTS alert_drill_idempotency (
+    drill_id    TEXT NOT NULL,
+    run_epoch   INTEGER NOT NULL,
+    idem_key    TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    response    TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (drill_id, run_epoch, idem_key)
+);
+
+-- At most one frozen report per (drill, run epoch).
+CREATE TABLE IF NOT EXISTS alert_drill_reports (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    drill_id   TEXT NOT NULL,
+    run_epoch  INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    content    TEXT NOT NULL,
+    checksum   TEXT NOT NULL,
+    UNIQUE(drill_id, run_epoch)
+);
 """
 
 

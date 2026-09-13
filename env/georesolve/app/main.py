@@ -55,6 +55,23 @@ Control plane (authenticated; see app.authz for the delegation model):
                                          silence); Idempotency-Key supported
   GET  /v1/health/alert-deliveries[/{id}] - outbox delivery status (attempts,
                                          next attempt, last error, replay count)
+
+Alert policy drills (isolated alert-pipeline replay, global drill:read/write):
+  POST /v1/health/alert-drills         - freeze a subscription revision plus a
+                                         real history slice into a new drill
+  GET  /v1/health/alert-drills[/{id}]  - list / detail (frozen input, private
+                                         events/deliveries, inbox count)
+  POST .../alert-drills/{id}/advance   - consume history rows (steps), move the
+                                         private clock (to_time), or settle all
+                                         retries/silence deadlines
+  POST .../alert-drills/{id}/pause|/resume|/reset
+  GET  .../alert-drills/{id}/steps/{seq} - one recorded delivery decision
+  GET  .../alert-drills/{id}/inbox     - the queryable simulated webhook inbox
+  POST .../alert-drills/{id}/report    - frozen per-run report + production diff
+  GET  /v1/health/alert-drills-audit   - drill-only audit trail
+A drill only ever touches alert_drill_* tables: no live events/deliveries/
+health are written, the clock is private and webhooks land only in the inbox.
+
   GET  /v1/cache               - cache contents, filtered by cache:read
   POST /v1/cache/flush         - drop cached answers inside the caller's
                                  cache:flush scope (audited)
@@ -226,6 +243,15 @@ from .drills import (
     DrillStore,
     DrillValidation,
     TransitionIn,
+)
+from .alert_drills import (
+    AlertDrillAdvanceIn,
+    AlertDrillConflict,
+    AlertDrillCreateIn,
+    AlertDrillNotFound,
+    AlertDrillStore,
+    AlertDrillTransitionIn,
+    AlertDrillValidation,
 )
 from .health import HealthChecker, HealthRegistry
 from .health_alerts import (
@@ -535,6 +561,10 @@ class Components:
         self.metering = MeteringStore(db, self.audit, time.time)
         self.disputes = DisputeStore(db, self.metering, self.audit, time.time)
         self.drills = DrillStore(db, self.config, self.health, time.time)
+        # Alert-policy drills replay a frozen subscription revision + history
+        # slice against a private clock/outbox/inbox: they never write the
+        # live history, event or delivery tables and never hit the network.
+        self.alert_drills = AlertDrillStore(db, time.time)
         self.plans = PlanStore(db, self.config, self.drills, time.time)
         self.config.add_listener(
             self.rate_limiter.replace_buckets,
@@ -764,6 +794,29 @@ def create_app(components: Components) -> FastAPI:
 
     @app.exception_handler(AlertValidation)
     async def _alert_validation(_req, exc: AlertValidation):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(AlertDrillNotFound)
+    async def _alert_drill_not_found(_req, exc: AlertDrillNotFound):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(AlertDrillConflict)
+    async def _alert_drill_conflict(_req, exc: AlertDrillConflict):
+        # Semantic refusals (version conflicts, exhausted rows, idempotency
+        # clashes) are already recorded in the alert-drill audit by the store.
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(AlertDrillValidation)
+    async def _alert_drill_validation(_req, exc: AlertDrillValidation):
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": str(exc), "code": exc.code},
@@ -1846,6 +1899,177 @@ def create_app(components: Components) -> FastAPI:
         ev = comp.alerts.get_event(delivery["event_id"])
         authorize_alert_target_read(caller, ev["target_id"])
         return {"delivery": delivery}
+
+    # -- alert policy drills (isolated alert-pipeline replay) --------------
+
+    def alert_drill_fp(body: dict) -> str:
+        return drill_fingerprint(body)
+
+    @app.post("/v1/health/alert-drills", status_code=201)
+    async def create_alert_drill(
+        req: AlertDrillCreateIn,
+        caller: Caller = Depends(authenticated),
+    ):
+        # A drill freezes a subscription (which may target '*') and real
+        # history: global drill grants only, like the resolution fault drills.
+        authorize_drill(caller, "drill:write")
+        drill = comp.alert_drills.create(req, actor=caller.identity_id)
+        return {"drill": drill}
+
+    @app.get("/v1/health/alert-drills")
+    async def list_alert_drills(
+        status: Optional[str] = Query(default=None),
+        subscription_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        drills = comp.alert_drills.list_drills(
+            status=status, sub_id=subscription_id, limit=limit
+        )
+        return {"drills": drills, "count": len(drills)}
+
+    @app.get("/v1/health/alert-drills/{drill_id}")
+    async def get_alert_drill(
+        drill_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_drill(caller, "drill:read")
+        return {"drill": comp.alert_drills.get(drill_id)}
+
+    @app.post("/v1/health/alert-drills/{drill_id}/advance")
+    async def advance_alert_drill(
+        drill_id: str,
+        req: AlertDrillAdvanceIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        status_code, payload = comp.alert_drills.advance(
+            drill_id,
+            req,
+            actor=caller.identity_id,
+            idem_key=idempotency_key,
+            fingerprint=(
+                alert_drill_fp(req.model_dump()) if idempotency_key else None
+            ),
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/health/alert-drills/{drill_id}/pause")
+    async def pause_alert_drill(
+        drill_id: str,
+        req: AlertDrillTransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        status_code, payload = comp.alert_drills.pause(
+            drill_id,
+            actor=caller.identity_id,
+            expected_version=req.expected_version,
+            reason=req.reason,
+            idem_key=idempotency_key,
+            fingerprint=(
+                alert_drill_fp(req.model_dump()) if idempotency_key else None
+            ),
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/health/alert-drills/{drill_id}/resume")
+    async def resume_alert_drill(
+        drill_id: str,
+        req: AlertDrillTransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        status_code, payload = comp.alert_drills.resume(
+            drill_id,
+            actor=caller.identity_id,
+            expected_version=req.expected_version,
+            reason=req.reason,
+            idem_key=idempotency_key,
+            fingerprint=(
+                alert_drill_fp(req.model_dump()) if idempotency_key else None
+            ),
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/health/alert-drills/{drill_id}/reset")
+    async def reset_alert_drill(
+        drill_id: str,
+        req: AlertDrillTransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        status_code, payload = comp.alert_drills.reset(
+            drill_id,
+            actor=caller.identity_id,
+            expected_version=req.expected_version,
+            reason=req.reason,
+            idem_key=idempotency_key,
+            fingerprint=(
+                alert_drill_fp(req.model_dump()) if idempotency_key else None
+            ),
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.get("/v1/health/alert-drills/{drill_id}/steps/{seq}")
+    async def get_alert_drill_step(
+        drill_id: str,
+        seq: int,
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        return {
+            "drill_id": drill_id,
+            "step": comp.alert_drills.get_step(drill_id, seq),
+        }
+
+    @app.get("/v1/health/alert-drills/{drill_id}/inbox")
+    async def get_alert_drill_inbox(
+        drill_id: str,
+        status: Optional[str] = Query(default=None),
+        attempt: Optional[int] = Query(default=None, ge=1),
+        limit: int = Query(default=100, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        return comp.alert_drills.inbox(
+            drill_id, status=status, attempt=attempt, limit=limit
+        )
+
+    @app.post("/v1/health/alert-drills/{drill_id}/report")
+    async def alert_drill_report(
+        drill_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_drill(caller, "drill:read")
+        # Read-only: generated once per run epoch, then frozen and replayed
+        # identically (same content and checksum) for every repeat.
+        return comp.alert_drills.report(drill_id)
+
+    @app.get("/v1/health/alert-drills-audit")
+    async def alert_drills_audit(
+        drill_id: Optional[str] = Query(default=None),
+        action: Optional[str] = Query(default=None),
+        since: Optional[float] = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=2000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        records = comp.alert_drills.drill_audit(
+            drill_id, action=action, since=since, limit=limit
+        )
+        return {"records": records, "count": len(records)}
 
     @app.get("/v1/cache")
     async def get_cache(caller: Caller = Depends(authenticated)):

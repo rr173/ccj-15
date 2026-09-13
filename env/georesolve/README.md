@@ -655,6 +655,71 @@
 | `POST /v1/health/alert-events/{id}/replay` | 强制按原快照重新投递（跳过静默；未确认/已取代事件 409；幂等键） |
 | `GET /v1/health/alert-deliveries?subscription_id=&event_id=&status=` / `.../{id}` | 投递状态查询（尝试次数、下次尝试、错误、状态码、replay 次数） |
 
+## 告警策略演练（alert policy drills）
+
+管理员可针对**某个订阅的指定修订版本**（`sub_version`，缺省为当前修订）和一段
+**真实历史健康事件**（`since`/`until` 时间窗内，按全局 `id` 排序）创建独立演练。
+创建时一次性**固定输入快照**：
+
+- 冻结的订阅完整快照（目标、来源、连续阈值、静默窗口、重试/退避参数、webhook
+  地址/自定义头；签名密钥单独随演练冻结，但**任何读接口都不回显**）；
+- 冻结的历史行副本（窗口内全部 check 行 + 订阅来源会命中的 transition 行，
+  逐字复制，后续线上历史变化不影响演练）；
+- 脚本化的 webhook 结果计划 `send_script`（按尝试序号/事件类型/目标匹配，
+  未命中规则用 `default_outcome`）与独立时钟锚点（缺省为首个历史行的事件时间）。
+
+### 独立时钟、独立队列与完全隔离
+
+- 演练只读写 `alert_drill_*` 一组表，**绝不**写 `health_check_history`、
+  `health_alert_events`、`health_alert_deliveries`，不改线上健康状态、不调用真实
+  审计表，也**不做任何网络 I/O**：每次“webhook 投递”只追加到该演练的
+  **模拟收件箱**（`alert_drill_inbox`），可用接口查询（URL、头、签名、载荷、
+  尝试序号、模拟投递时刻）。
+- **独立时钟**是演练行里的一个存储标量，只随推进移动（跟随事件时间，单调不倒退），
+  墙钟仅用于 `created_at`/`recorded_at`。普通推进按历史行的事件时间走；
+  `to_time` 做**纯时钟推进**（不消费历史行），用于让静默窗口到期、让指数退避
+  到期；`settle` 自动把时钟逐个跳到未来最近的抑制释放/重试截止点并反复泵送，
+  直到没有可随时间改变的投递。
+- 每次推进在私有引擎里复刻线上语义：目标/来源匹配、连续阈值确认（后续 check 推进
+  或打断未确认 streak，反向 verdict 置 `superseded`）、静默窗口抑制与到期释放、
+  `base*2^(attempts-1)`（封顶 `backoff_max`）退避、`max_retries` 用尽置 `dead`；
+  维护/override 类事件不受连续阈值约束，立即激活。每一步都记录**抑制判断与重试
+  判断**（命中事件、初始投递状态/静默窗口、确认激活、抑制释放、每次尝试结果与
+  backoff、被取代等）。
+
+### 生命周期、并发与持久化
+
+- `ready -> running <-> paused -> completed`。消费完冻结行且不存在等待时钟的
+  投递（pending/failed/suppressed）即完成；末尾仍未确认的 streak 是“永未触发”的
+  终态。暂停态不可推进（409）。`reset` 开启新的 **run epoch** 回到 `ready`，
+  旧 epoch 的步骤/收件箱/报告保留备查但不影响新 run。
+- 所有变更在存储锁内串行；推进接受 `expected_version`（不符返回 **409**
+  `expected_version`）与 `Idempotency-Key`（按 `(演练, run_epoch)` 隔离，重复
+  提交重放同一响应 `idempotent_replay:true`，同键不同载荷 409）。并发推进同一
+  演练不会重复消费/重复投递；reset 后旧幂等键失效。
+- 演练行、步骤、事件/投递私有镜像、收件箱、独立演练审计
+  （`alert_drill_audit`，与真实 `audit` 分离）、幂等键与一次性报告**全部落
+  SQLite，重启后进度、收件箱与冻结报告保持**。
+- 报告每个 run epoch 只生成一次（之后内容与 checksum 原样重放），固定包含输入
+  快照、每步抑制/重试决策、最终统计（按状态的事件/投递数、尝试次数、成功/死亡/
+  抑制/待发数、收件箱消息数）和**与线上实际结果的差异报告**：按底层 transition
+  历史 id 对齐，逐条给出 `same` / `status_mismatch` / `attempt_count_mismatch`
+  / `event_without_delivery` / `no_production_event`。
+- 授权与解析故障演练一致：仅 **global** `drill:read`/`drill:write`（冻结的是
+  订阅全量快照，可能为 `"*"` 目标）。
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /v1/health/alert-drills` | 基于订阅修订+历史时间窗创建演练，固定输入快照，201 |
+| `GET /v1/health/alert-drills?status=&subscription_id=&limit=` | 演练列表 |
+| `GET /v1/health/alert-drills/{id}` | 演练详情（冻结输入、游标、私有事件/投递、收件箱计数） |
+| `POST /v1/health/alert-drills/{id}/advance` | 推进（`steps` 消费历史行；`to_time` 纯时钟；`settle` 自动泵送；支持 `expected_version`/幂等键） |
+| `POST /v1/health/alert-drills/{id}/pause` / `/resume` / `/reset` | 暂停 / 恢复 / 重置（新 run epoch；均支持版本与幂等键） |
+| `GET /v1/health/alert-drills/{id}/steps/{seq}` | 单步投递决定记录 |
+| `GET /v1/health/alert-drills/{id}/inbox?status=&attempt=&limit=` | 查询模拟收件箱（仅演练内可见，绝不真正外发） |
+| `POST /v1/health/alert-drills/{id}/report` | 冻结的一次性报告（输入快照、逐步决策、统计、线上差异） |
+| `GET /v1/health/alert-drills-audit?drill_id=&action=&since=` | 独立演练审计 |
+
 ## API
 
 数据面（无需认证）：
