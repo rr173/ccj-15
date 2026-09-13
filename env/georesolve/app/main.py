@@ -110,6 +110,37 @@ private health registry, private simulated-clock cache and a null audit
 sink: the live health view, resolution cache, rate-limit buckets, metering
 and the real audit log are never touched. Drill state, steps, per-(drill,
 run-epoch) idempotency keys and one-shot reports are all SQLite-persisted.
+
+Reusable drill plans, independent runs and branches (same permissions):
+  POST   /v1/drill-plans                        - save a completed drill (or
+                                                 a saved version + sequence)
+                                                 as a named frozen plan
+  GET    /v1/drill-plans                        - list plans
+  GET    /v1/drill-plans/{id}                   - frozen plan detail
+  POST   /v1/drill-plans/{id}/archive           - archive (no new runs)
+  POST   /v1/drill-plans/{id}/runs              - start an independent run
+                                                 (owner_id + note)
+  GET    /v1/drill-plans/{id}/runs              - runs of one plan
+  GET    /v1/drill-runs                         - list/filter runs
+                                                 (?plan_id=&owner_id=&status=)
+  GET    /v1/drill-runs/{id}                    - run detail (owner only)
+  GET    /v1/drill-runs/{id}/steps/{seq}        - one recorded/inherited step
+  POST   /v1/drill-runs/{id}/advance            - replay the next step
+  POST   /v1/drill-runs/{id}/pause|/resume|/reset
+  POST   /v1/drill-runs/{id}/report             - frozen per-run report
+  POST   /v1/drill-runs/{id}/branches           - branch from a recorded step
+  POST   /v1/drill-runs/{id}/compare            - frozen pair comparison
+  GET    /v1/drill-plans-audit                  - plan/run audit trail
+
+A plan freezes the config version, target manifest, normalized step inputs
+and expected results and a shared simulated-clock anchor. Runs share no
+mutable state (health, cache, step results, lifecycle); a branch inherits a
+read-only prefix of another run's inputs/results and replaces the tail, and
+the parent's later progress never touches the branch. Non-privileged
+identities may read or operate only runs they own. Plan/run/branch creation,
+archival and every lifecycle action accept Idempotency-Key plus
+expected_version; a run pair has exactly one frozen comparison report,
+pinned to the two run versions at first generation.
 """
 from __future__ import annotations
 
@@ -183,6 +214,21 @@ from .metering import (
     PolicyDenied,
 )
 from .models import ConfigBundle
+from .plans import (
+    BranchCreateIn,
+    CompareIn,
+    PlanArchiveIn,
+    PlanConflict,
+    PlanCreateIn,
+    PlanForbidden,
+    PlanNotFound,
+    PlanStore,
+    PlanValidation,
+    RunCreateIn,
+    RunNotFound,
+    RunTransitionIn,
+    RunAdvanceIn,
+)
 from .rate_limit import RateLimitExceeded, RateLimiter
 from .resolver import Resolver
 from .storage import connect
@@ -428,6 +474,7 @@ class Components:
         self.metering = MeteringStore(db, self.audit, time.time)
         self.disputes = DisputeStore(db, self.metering, self.audit, time.time)
         self.drills = DrillStore(db, self.config, self.health, time.time)
+        self.plans = PlanStore(db, self.config, self.drills, time.time)
         self.config.add_listener(
             self.rate_limiter.replace_buckets,
             self.rate_limiter.preview_replace,
@@ -571,6 +618,41 @@ def create_app(components: Components) -> FastAPI:
 
     @app.exception_handler(DrillValidation)
     async def _drill_validation(_req, exc: DrillValidation):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(PlanNotFound)
+    async def _plan_not_found(_req, exc: PlanNotFound):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(RunNotFound)
+    async def _run_not_found(_req, exc: RunNotFound):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(PlanForbidden)
+    async def _plan_forbidden(_req, exc: PlanForbidden):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(PlanConflict)
+    async def _plan_conflict(_req, exc: PlanConflict):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(PlanValidation)
+    async def _plan_validation(_req, exc: PlanValidation):
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": str(exc), "code": exc.code},
@@ -2271,6 +2353,293 @@ def create_app(components: Components) -> FastAPI:
         authorize_drill(caller, "drill:read")
         records = comp.drills.drill_audit(
             drill_id, action=action, since=since, limit=limit
+        )
+        return {"records": records, "count": len(records)}
+
+    # -- reusable drill plans, runs and branches ----------------------------
+
+    def plan_fp(request: Request, caller: Caller, body: dict) -> str:
+        # Bind the key to endpoint path as well, so one key can never replay
+        # a *different* endpoint's stored response.
+        return request_fingerprint(
+            request.method, request.url.path, caller.identity_id, body
+        )
+
+    @app.post("/v1/drill-plans", status_code=201)
+    async def create_plan(
+        req: PlanCreateIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        fp = plan_fp(request, caller, req.model_dump()) if idempotency_key else None
+        status_code, payload = comp.plans.create_plan(
+            req,
+            actor=caller.identity_id,
+            idem_key=idempotency_key,
+            fingerprint=fp,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.get("/v1/drill-plans")
+    async def list_plans(
+        status: Optional[str] = Query(default=None),
+        config_version: Optional[int] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        plans = comp.plans.list_plans(
+            status=status, config_version=config_version, limit=limit
+        )
+        return {"plans": plans, "count": len(plans)}
+
+    @app.get("/v1/drill-plans/{plan_id}")
+    async def get_plan(
+        plan_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_drill(caller, "drill:read")
+        return {"plan": comp.plans.get_plan(plan_id)}
+
+    @app.post("/v1/drill-plans/{plan_id}/archive")
+    async def archive_plan(
+        plan_id: str,
+        req: PlanArchiveIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        fp = plan_fp(request, caller, req.model_dump()) if idempotency_key else None
+        status_code, payload = comp.plans.archive_plan(
+            plan_id,
+            req,
+            actor=caller.identity_id,
+            idem_key=idempotency_key,
+            fingerprint=fp,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/drill-plans/{plan_id}/runs", status_code=201)
+    async def create_plan_run(
+        plan_id: str,
+        req: RunCreateIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        fp = plan_fp(request, caller, req.model_dump()) if idempotency_key else None
+        status_code, payload = comp.plans.create_run(
+            plan_id,
+            req,
+            actor=caller.identity_id,
+            idem_key=idempotency_key,
+            fingerprint=fp,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.get("/v1/drill-plans/{plan_id}/runs")
+    async def list_plan_runs(
+        plan_id: str,
+        owner_id: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        # 404 on an unknown plan even before owner filtering.
+        comp.plans.get_plan(plan_id)
+        runs = comp.plans.list_runs(
+            plan_id=plan_id,
+            owner_id=owner_id,
+            status=status,
+            actor=caller.identity_id,
+            limit=limit,
+        )
+        return {"runs": runs, "count": len(runs)}
+
+    @app.get("/v1/drill-runs")
+    async def list_all_runs(
+        plan_id: Optional[str] = Query(default=None),
+        owner_id: Optional[str] = Query(default=None),
+        status: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        runs = comp.plans.list_runs(
+            plan_id=plan_id,
+            owner_id=owner_id,
+            status=status,
+            actor=caller.identity_id,
+            limit=limit,
+        )
+        return {"runs": runs, "count": len(runs)}
+
+    @app.get("/v1/drill-runs/{run_id}")
+    async def get_run(
+        run_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_drill(caller, "drill:read")
+        return {"run": comp.plans.get_run(run_id, actor=caller.identity_id)}
+
+    @app.get("/v1/drill-runs/{run_id}/steps/{seq}")
+    async def get_run_step(
+        run_id: str,
+        seq: int,
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        return {
+            "run_id": run_id,
+            "step": comp.plans.run_step(run_id, seq, actor=caller.identity_id),
+        }
+
+    @app.post("/v1/drill-runs/{run_id}/advance")
+    async def advance_run(
+        run_id: str,
+        req: RunAdvanceIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        fp = drill_fingerprint(req.model_dump()) if idempotency_key else None
+        status_code, payload = comp.plans.advance(
+            run_id,
+            req,
+            actor=caller.identity_id,
+            idem_key=idempotency_key,
+            fingerprint=fp,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    def _run_transition_endpoint(
+        run_id: str,
+        req: RunTransitionIn,
+        caller: Caller,
+        idempotency_key: Optional[str],
+        method: Callable,
+    ):
+        authorize_drill(caller, "drill:write")
+        fp = drill_fingerprint(req.model_dump()) if idempotency_key else None
+        return method(
+            run_id,
+            actor=caller.identity_id,
+            expected_version=req.expected_version,
+            reason=req.reason,
+            idem_key=idempotency_key,
+            fingerprint=fp,
+        )
+
+    @app.post("/v1/drill-runs/{run_id}/pause")
+    async def pause_run(
+        run_id: str,
+        req: RunTransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        status_code, payload = _run_transition_endpoint(
+            run_id, req, caller, idempotency_key, comp.plans.pause_run
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/drill-runs/{run_id}/resume")
+    async def resume_run(
+        run_id: str,
+        req: RunTransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        status_code, payload = _run_transition_endpoint(
+            run_id, req, caller, idempotency_key, comp.plans.resume_run
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/drill-runs/{run_id}/reset")
+    async def reset_run(
+        run_id: str,
+        req: RunTransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        status_code, payload = _run_transition_endpoint(
+            run_id, req, caller, idempotency_key, comp.plans.reset_run
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/drill-runs/{run_id}/report")
+    async def run_report(
+        run_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_drill(caller, "drill:read")
+        return comp.plans.run_report(run_id, actor=caller.identity_id)
+
+    @app.post("/v1/drill-runs/{run_id}/branches", status_code=201)
+    async def create_branch(
+        run_id: str,
+        req: BranchCreateIn,
+        request: Request,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        fp = plan_fp(request, caller, req.model_dump()) if idempotency_key else None
+        status_code, payload = comp.plans.create_branch(
+            run_id,
+            req,
+            actor=caller.identity_id,
+            idem_key=idempotency_key,
+            fingerprint=fp,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/drill-runs/{run_id}/compare")
+    async def compare_runs(
+        run_id: str,
+        req: CompareIn,
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        return comp.plans.compare(
+            run_id, req.other_run_id, actor=caller.identity_id
+        )
+
+    @app.get("/v1/drill-plans-audit")
+    async def plans_audit(
+        plan_id: Optional[str] = Query(default=None),
+        run_id: Optional[str] = Query(default=None),
+        action: Optional[str] = Query(default=None),
+        since: Optional[float] = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=2000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        records = comp.plans.plan_audit(
+            plan_id=plan_id,
+            run_id=run_id,
+            action=action,
+            since=since,
+            limit=limit,
+            actor=caller.identity_id,
         )
         return {"records": records, "count": len(records)}
 

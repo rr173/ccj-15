@@ -172,6 +172,226 @@ def _snapshot_from_bundle(bundle: ConfigBundle) -> Snapshot:
     return Snapshot(bundle.version, bundle.defaults, rule_map, group_map, tier_map)
 
 
+def replay_step(
+    frozen: dict,
+    health_state: dict,
+    cache_state: list[dict],
+    step_spec: dict,
+    sim_now: float,
+) -> tuple[dict, list[dict], dict]:
+    """Run one fully isolated replay from explicit state.
+
+    Shared by drills and by reusable drill-plan runs/branches. The caller
+    owns all state: ``frozen`` is the build_frozen() payload, ``health_state``
+    is the current {target_id: bool} set and ``cache_state`` is the serialized
+    simulated cache (see _dump_cache). Returns
+    ``(answer, cache_rows_after, health_after)`` -- nothing leaks into live
+    state and no shared mutable collaborator is touched.
+    """
+    # Seed every frozen target explicitly (unknown targets fail open
+    # anyway, but seeding makes the recorded health set complete).
+    health_map = {tid: True for tid in frozen["target_manifest"]}
+    health_map.update(health_state)
+
+    # Apply the step's simulated health changes to the private registry.
+    sim_health = _SimHealth(health_map)
+    for tid, healthy in (step_spec.get("health_changes") or {}).items():
+        sim_health.set(tid, bool(healthy), now=sim_now)
+    health_after = sim_health.snapshot_booleans()
+
+    labels = normalize_labels(step_spec.get("labels") or {})
+    holder = _Holder(sim_now)
+    cache = _load_cache(holder, cache_state or [])
+    resolver = Resolver(
+        _FrozenConfig(_snapshot_from_bundle(ConfigBundle(**frozen["bundle"]))),
+        cache,
+        sim_health,
+        _NullAudit(),
+        rate_limiter=None,
+        metering=None,
+        clock=holder,
+    )
+    answer = resolver.resolve(
+        step_spec["name"],
+        step_spec.get("region", ""),
+        step_spec.get("tenant", ""),
+        step_spec.get("client") or "",
+        labels=labels,
+        now=sim_now,
+    )
+    return answer, _dump_cache(cache), health_after
+
+
+def target_order(answer: dict) -> list[str]:
+    """Ordered target ids of a resolver answer."""
+    return [t["id"] for t in answer.get("targets", [])]
+
+
+def expected_diff(expected: Optional[dict], answer: dict, order: list[str]) -> list[dict]:
+    """Field-level expected-vs-actual differences for one recorded step."""
+    if not expected:
+        return []
+    diffs: list[dict] = []
+    if "chosen" in expected and expected["chosen"] != answer.get("chosen"):
+        diffs.append(
+            {
+                "field": "chosen",
+                "expected": expected["chosen"],
+                "actual": answer.get("chosen"),
+            }
+        )
+    if "status" in expected and expected["status"] != answer.get("status"):
+        diffs.append(
+            {
+                "field": "status",
+                "expected": expected["status"],
+                "actual": answer.get("status"),
+            }
+        )
+    if "order" in expected and list(expected["order"]) != order:
+        diffs.append(
+            {
+                "field": "order",
+                "expected": list(expected["order"]),
+                "actual": order,
+            }
+        )
+    if "degraded" in expected and bool(expected["degraded"]) != bool(
+        answer.get("degraded")
+    ):
+        diffs.append(
+            {
+                "field": "degraded",
+                "expected": bool(expected["degraded"]),
+                "actual": bool(answer.get("degraded")),
+            }
+        )
+    return diffs
+
+
+def public_cache_view(cache_rows: list[dict]) -> list[dict]:
+    """The reduced, safe-to-expose view of serialized cache entries."""
+    return [
+        {
+            "kind": e["kind"],
+            "name": e["name"],
+            "region": e["region"],
+            "tenant": e["tenant"],
+            "client_key": e["client_key"],
+            "labels_sig": e["labels_sig"],
+            "rule_version": e["rule_version"],
+            "group_id": e["group_id"],
+            "stored_at": e["stored_at"],
+            "expires_at": e["expires_at"],
+        }
+        for e in cache_rows
+    ]
+
+
+# Result keys kept only inside persistence (e.g. the full cache rows a branch
+# may need to resume from); never serialized to API responses.
+_INTERNAL_STEP_KEYS = ("cache_rows_full",)
+
+
+def public_step_result(result: dict) -> dict:
+    """Strip persistence-only fields from a recorded step result."""
+    return {k: v for k, v in result.items() if k not in _INTERNAL_STEP_KEYS}
+
+
+def cache_keys(cache_rows: list[dict]) -> list:
+    """Sorted identity keys present in a serialized simulated cache."""
+    return sorted(
+        {
+            (
+                e["name"],
+                e["region"],
+                e["tenant"],
+                e["client_key"],
+                e["labels_sig"],
+            )
+            for e in (cache_rows or [])
+        }
+    )
+
+
+def compose_step_result(
+    *,
+    seq: int,
+    step_spec: dict,
+    answer: dict,
+    order: list[str],
+    cache_rows: list[dict],
+    health_after: dict,
+    sim_now: float,
+    status_before: str,
+    version_before: int,
+    health_before: dict,
+    cache_keys_before: list,
+    started_at: float,
+    recorded_at: float,
+    inherited: bool = False,
+    inherited_from: Optional[dict] = None,
+) -> dict:
+    """Assemble the persisted/recorded result dict of one replayed step.
+
+    ``cache_rows`` is the *full* serialized cache after the step (kept in
+    persistence so a branch can continue from an arbitrary step); the public
+    view under ``cache_state_after`` carries only the reduced fields.
+    """
+    expected = step_spec.get("expected")
+    diffs = expected_diff(expected, answer, order)
+    labels = step_spec.get("labels") or {}
+    request = {
+        "name": step_spec["name"],
+        "region": step_spec.get("region", ""),
+        "tenant": step_spec.get("tenant", ""),
+        "client": step_spec.get("client", ""),
+        "labels": labels,
+        "labels_sig": labels_signature(labels),
+    }
+    return {
+        "seq": seq,
+        "started_at": started_at,
+        "recorded_at": recorded_at,
+        "sim_time": sim_now,
+        "input": {
+            "seq": seq,
+            "request": request,
+            "sim_time": sim_now,
+            "health_before": dict(health_before),
+            "health_changes": dict(step_spec.get("health_changes") or {}),
+            "cache_keys_before": cache_keys_before,
+            "status_before": status_before,
+            "version_before": version_before,
+        },
+        "health_after": health_after,
+        "request": request,
+        "answer": {
+            "status": answer.get("status"),
+            "chosen": answer.get("chosen"),
+            "degraded": answer.get("degraded", False),
+            "order": order,
+            "targets": answer.get("targets", []),
+            "rule_version": answer.get("rule_version"),
+            "rule_scope": answer.get("rule_scope"),
+            "release_group": answer.get("release_group"),
+            "config_version": answer.get("config_version"),
+            "ttl": answer.get("ttl"),
+            "expires_at": answer.get("expires_at"),
+        },
+        "order": order,
+        "cache_hit": bool(answer.get("cached")),
+        "cache_state_after": public_cache_view(cache_rows),
+        "cache_rows_full": cache_rows,
+        "expected": expected,
+        "matched_expected": not diffs,
+        "diffs": diffs,
+        "diff_reasons": [d["field"] for d in diffs],
+        "inherited": inherited,
+        "inherited_from": inherited_from,
+    }
+
+
 @dataclass
 class _FrozenConfig:
     """Minimal ConfigManager surface the Resolver consumes; frozen forever."""
@@ -771,90 +991,23 @@ class DrillStore:
         drill: dict,
         step_spec: dict,
         sim_now: float,
-    ) -> tuple[dict, ResolutionCache, dict]:
-        """Run one isolated replay; returns (answer, cache_after, health_after)."""
-        frozen = drill["frozen"]
-        # Seed every frozen target explicitly (unknown targets fail open
-        # anyway, but seeding makes the recorded health set complete).
-        health_map = {tid: True for tid in frozen["target_manifest"]}
-        health_map.update(drill["health"])
-
-        # Apply the step's simulated health changes to the private registry.
-        sim_health = _SimHealth(health_map)
-        changes = step_spec.get("health_changes") or {}
-        applied = {}
-        for tid, healthy in changes.items():
-            sim_health.set(tid, bool(healthy), now=sim_now)
-            applied[tid] = bool(healthy)
-        health_after = sim_health.snapshot_booleans()
-
-        labels = normalize_labels(step_spec.get("labels") or {})
-        holder = _Holder(sim_now)
-        cache = _load_cache(holder, drill.get("cache_state") or [])
-        resolver = Resolver(
-            self._frozen_view(frozen),
-            cache,
-            sim_health,
-            _NullAudit(),
-            rate_limiter=None,
-            metering=None,
-            clock=holder,
+    ) -> tuple[dict, list[dict], dict]:
+        """Run one isolated replay; returns (answer, cache_rows_after, health_after)."""
+        return replay_step(
+            drill["frozen"],
+            drill["health"],
+            drill.get("cache_state") or [],
+            step_spec,
+            sim_now,
         )
-        client = step_spec.get("client") or ""
-        answer = resolver.resolve(
-            step_spec["name"],
-            step_spec.get("region", ""),
-            step_spec.get("tenant", ""),
-            client,
-            labels=labels,
-            now=sim_now,
-        )
-        return answer, cache, health_after
 
     @staticmethod
     def _expected_diff(expected: Optional[dict], answer: dict, order: list[str]) -> list[dict]:
-        if not expected:
-            return []
-        diffs: list[dict] = []
-        if "chosen" in expected and expected["chosen"] != answer.get("chosen"):
-            diffs.append(
-                {
-                    "field": "chosen",
-                    "expected": expected["chosen"],
-                    "actual": answer.get("chosen"),
-                }
-            )
-        if "status" in expected and expected["status"] != answer.get("status"):
-            diffs.append(
-                {
-                    "field": "status",
-                    "expected": expected["status"],
-                    "actual": answer.get("status"),
-                }
-            )
-        if "order" in expected and list(expected["order"]) != order:
-            diffs.append(
-                {
-                    "field": "order",
-                    "expected": list(expected["order"]),
-                    "actual": order,
-                }
-            )
-        if "degraded" in expected and bool(expected["degraded"]) != bool(
-            answer.get("degraded")
-        ):
-            diffs.append(
-                {
-                    "field": "degraded",
-                    "expected": bool(expected["degraded"]),
-                    "actual": bool(answer.get("degraded")),
-                }
-            )
-        return diffs
+        return expected_diff(expected, answer, order)
 
     @staticmethod
     def _target_order(answer: dict) -> list[str]:
-        return [t["id"] for t in answer.get("targets", [])]
+        return target_order(answer)
 
     def _advance(
         self,
@@ -939,85 +1092,35 @@ class DrillStore:
                 sim_now = drill["base_sim_time"]
 
             started_at = self._clock()
-            input_snapshot = {
-                "seq": seq,
-                "request": {
-                    "name": step_spec["name"],
-                    "region": step_spec.get("region", ""),
-                    "tenant": step_spec.get("tenant", ""),
-                    "client": step_spec.get("client", ""),
-                    "labels": step_spec.get("labels", {}),
-                    "labels_sig": labels_signature(step_spec.get("labels") or {}),
-                },
-                "sim_time": sim_now,
-                "health_before": dict(drill["health"]),
-                "health_changes": dict(step_spec.get("health_changes") or {}),
-                "cache_keys_before": sorted(
-                    {
-                        (e["name"], e["region"], e["tenant"], e["client_key"], e["labels_sig"])
-                        for e in drill.get("cache_state") or []
-                    }
-                ),
-                "status_before": status,
-                "version_before": version,
-            }
+            cache_keys_before = cache_keys(drill.get("cache_state") or [])
 
-            answer, cache_after, health_after = self._replay(
+            answer, cache_rows, health_after = self._replay(
                 drill, step_spec, sim_now
             )
-            order = self._target_order(answer)
+            order = target_order(answer)
             expected = step_spec.get("expected")
-            diffs = self._expected_diff(expected, answer, order)
-            matched = not diffs
+            recorded_at = self._clock()
+            result = compose_step_result(
+                seq=seq,
+                step_spec=step_spec,
+                answer=answer,
+                order=order,
+                cache_rows=cache_rows,
+                health_after=health_after,
+                sim_now=sim_now,
+                status_before=status,
+                version_before=version,
+                health_before=dict(drill["health"]),
+                cache_keys_before=cache_keys_before,
+                started_at=started_at,
+                recorded_at=recorded_at,
+            )
+            diffs = result["diffs"]
+            matched = result["matched_expected"]
 
             # Whether the served answer came from the simulated cache. The
             # resolver returns cached=True only for a valid, unexpired entry.
-            cached_hit = bool(answer.get("cached"))
-            cache_rows = _dump_cache(cache_after)
-
-            result = {
-                "seq": seq,
-                "started_at": started_at,
-                "recorded_at": self._clock(),
-                "sim_time": sim_now,
-                "input": input_snapshot,
-                "health_after": health_after,
-                "request": input_snapshot["request"],
-                "answer": {
-                    "status": answer.get("status"),
-                    "chosen": answer.get("chosen"),
-                    "degraded": answer.get("degraded", False),
-                    "order": order,
-                    "targets": answer.get("targets", []),
-                    "rule_version": answer.get("rule_version"),
-                    "rule_scope": answer.get("rule_scope"),
-                    "release_group": answer.get("release_group"),
-                    "config_version": answer.get("config_version"),
-                    "ttl": answer.get("ttl"),
-                    "expires_at": answer.get("expires_at"),
-                },
-                "order": order,
-                "cache_hit": cached_hit,
-                "cache_state_after": [
-                    {
-                        "kind": e["kind"],
-                        "name": e["name"],
-                        "region": e["region"],
-                        "tenant": e["tenant"],
-                        "client_key": e["client_key"],
-                        "labels_sig": e["labels_sig"],
-                        "rule_version": e["rule_version"],
-                        "group_id": e["group_id"],
-                        "stored_at": e["stored_at"],
-                        "expires_at": e["expires_at"],
-                    }
-                    for e in cache_rows
-                ],
-                "expected": expected,
-                "matched_expected": matched,
-                "diffs": diffs,
-                "diff_reasons": [d["field"] for d in diffs],
-            }
+            cached_hit = result["cache_hit"]
 
             new_status = (
                 STATUS_COMPLETED if seq == total else STATUS_RUNNING
@@ -1348,7 +1451,7 @@ class DrillStore:
                 f"step {seq} has not been recorded in drill {drill_id!r}'s "
                 "current run",
             )
-        return json.loads(row["result"])
+        return public_step_result(json.loads(row["result"]))
 
     def steps(self, drill: dict) -> list[dict]:
         rows = self._conn.execute(
@@ -1356,7 +1459,7 @@ class DrillStore:
             " WHERE drill_id = ? AND run_epoch = ? ORDER BY seq",
             (drill["id"], drill["run_epoch"]),
         ).fetchall()
-        return [json.loads(r["result"]) for r in rows]
+        return [public_step_result(json.loads(r["result"])) for r in rows]
 
     def list_drills(
         self,

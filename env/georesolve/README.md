@@ -433,6 +433,79 @@
 | `POST /v1/drills/{id}/report` | 只读报告（每个 run 固定一份，带 checksum） |
 | `GET /v1/drills-audit?drill_id=&action=&since=&limit=` | 独立演练审计（与真实 `audit` 分离） |
 
+## 可复用演练计划、独立运行与分支（drill plans / runs / branches）
+
+管理员可把一个**已完成**的演练（或直接用已保存配置版本加步骤序列）保存为**命名计划**，
+之后从同一计划创建多次**完全独立**的运行，并可从运行中已完成的某一步**创建分支**。
+
+### 计划即冻结
+- `POST /v1/drill-plans`（体含 `name`、`source_drill_id`，或 `config_version`+`steps[]`，
+  可选 `plan_id`、`description`、`initial_health`、`expected_version`，支持幂等键）。
+  源演练未完成时 409 `drill_not_completed`。
+- 计划冻结：配置版本与完整 bundle、目标清单、规则/发布组/限流摘要、**逐步的请求输入与
+  预期结果**，以及所有运行共享的固定模拟时钟锚点（保证同计划不同运行可确定性对比）。
+- 计划不可变；唯一后续生命周期是归档（`POST /v1/drill-plans/{id}/archive`，支持
+  `expected_version` 与幂等键）。**已归档计划不能再创建运行**（409 `plan_archived`），
+  已存在的运行仍可推进。
+- 计划版本为乐观并发令牌：归档与每次创建运行都会 bump；并发修改只有一方成功。
+
+### 多次独立运行
+- `POST /v1/drill-plans/{id}/runs`（体可选 `run_id`、`owner_id`（缺省为调用身份）、
+  `note`、计划级 `expected_version`，支持幂等键）为每次运行分配**独立的**生命周期状态、
+  模拟健康注册表、模拟时钟缓存、逐步结果、运行版本与 reset epoch。
+- 运行之间**不共享**健康状态、缓存、步骤结果或生命周期：推进/暂停/重置/报告一个运行
+  绝不改变另一个运行、计划或任何分支。
+- 运行支持与演练一致的 `advance`/`pause`/`resume`/`reset`（运行级 `expected_version`
+  与按 `(运行, run_epoch)` 隔离的幂等键）、单步查询和每运行一份的只读报告。
+- **负责人隔离**：非全局管理员身份只能读取或操作 `owner_id` 为自己的运行（越权 403
+  `owner_mismatch`，审计留痕），列表自动按负责人过滤；可显式 `?owner_id=` 筛选。
+
+### 分支
+- `POST /v1/drill-runs/{id}/branches`（体含 `branch_point_seq` 与**替换尾部**步骤，
+  可选新 `run_id`、`owner_id`、`note`、父运行级 `expected_version`，支持幂等键）。
+- 分支只能从**已经完成（已记录）的某一步**创建（越界 409 `branch_point_invalid`，
+  从最后一步分支 409 `branch_tail_length`；替换步骤数必须恰好等于分支点之后的步数，
+  替换步骤按分支点后 1..n 编号）。
+- 分支**只读继承**分支点及之前所有步骤的输入与结果（答案、排序、缓存命中、健康集合、
+  以及该点完整的私有模拟缓存），之后的步骤可替换请求、健康变化与预期；分支是独立运行。
+- 父运行之后的推进、暂停、重置或报告都**不能改变分支**（reset 分支只回退到分支点，
+  继承前缀在新 epoch 中保持可见；reset 父运行也不触碰已独立的分支）。
+
+### 只读比较报告
+- `POST /v1/drill-runs/{id}/compare`（体含 `other_run_id`）生成**只读**比较报告。
+- 报告固定**首次比较时两个运行的版本**，并按固定顺序指出**第一处**差异：
+  `step_progress`（一方尚未记录该步）→ `step_input`（请求/标签/模拟时间）→
+  `health_set`（健康集合）→ `resolution_order`（解析排序）→ `cache_hit`（缓存命中）→
+  `expected_result`（预期结果）。
+- **同一对运行只生成一份报告**：以无序运行对为键，重复生成（无论请求方向、之后运行
+  是否继续推进）都重放同一内容与同一 `checksum`（`idempotent_replay:true`）。
+- 仅同一计划下的运行可比较（409 `compare_plan_mismatch`）；双方运行都必须归当前负责人
+  所有。
+
+### 持久化与接口
+- 计划、运行、步骤（含 `recorded`/`inherited` 两类）、运行关系、负责人、幂等记录、每运行
+  报告与比较报告全部落 SQLite；重启后计划快照、运行关系、负责人权限、分支结果、版本冲突
+  判定与报告校验值保持一致。
+- 与演练相同，仅 **global** `drill:read`/`drill:write` 授权可用。
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /v1/drill-plans` | 从已完成演练或版本+序列创建命名冻结计划，201（支持幂等键） |
+| `GET /v1/drill-plans?status=&config_version=&limit=` | 计划列表（含每计划 `run_count`） |
+| `GET /v1/drill-plans/{id}` | 计划详情（冻结内容、步骤规格、初始健康） |
+| `POST /v1/drill-plans/{id}/archive` | 归档计划（支持 `expected_version` 与幂等键） |
+| `POST /v1/drill-plans/{id}/runs` | 创建独立运行（`owner_id`/`note`/计划级 `expected_version`，支持幂等键），201 |
+| `GET /v1/drill-plans/{id}/runs?owner_id=&status=` | 该计划的运行列表（按负责人过滤） |
+| `GET /v1/drill-runs?plan_id=&owner_id=&status=` | 跨计划运行列表/按负责人筛选 |
+| `GET /v1/drill-runs/{id}` | 运行详情（仅负责人；含步骤、健康、模拟缓存） |
+| `GET /v1/drill-runs/{id}/steps/{seq}` | 单步结果（含只读 `inherited` 标记） |
+| `POST /v1/drill-runs/{id}/advance` | 推进下一步（支持 `expected_version` 与幂等键） |
+| `POST /v1/drill-runs/{id}/pause` / `.../resume` / `.../reset` | 暂停 / 恢复 / 重置（分支重置回退到分支点） |
+| `POST /v1/drill-runs/{id}/report` | 每运行只读报告（固定一份，带 checksum） |
+| `POST /v1/drill-runs/{id}/branches` | 从已记录步骤创建分支（支持幂等键与 expected_version），201 |
+| `POST /v1/drill-runs/{id}/compare` | 固定两运行版本的只读比较报告（每对唯一，带 checksum） |
+| `GET /v1/drill-plans-audit?plan_id=&run_id=&action=&since=&limit=` | 计划/运行独立审计 |
+
 ## API
 
 数据面（无需认证）：

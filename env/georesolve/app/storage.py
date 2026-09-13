@@ -449,6 +449,155 @@ CREATE TABLE IF NOT EXISTS drill_reports (
     content    TEXT NOT NULL,
     checksum   TEXT NOT NULL
 );
+
+-- ======================================================================
+-- Reusable drill plans, independent runs and branches
+--
+-- A plan freezes a completed drill (or a saved config version plus a step
+-- sequence) into an immutable, named artefact: config bundle, target
+-- manifest, rule summaries, normalized step inputs/expected results and the
+-- initial health set. Runs are fully independent replays of one plan;
+-- branches are runs that inherit a frozen prefix of another run's recorded
+-- steps and replace the tail. All state is persisted and survives restarts.
+-- ======================================================================
+CREATE TABLE IF NOT EXISTS drill_plans (
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    description      TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'active',  -- active|archived
+    config_version   INTEGER NOT NULL,
+    source_drill_id  TEXT,
+    spec             TEXT NOT NULL,     -- frozen normalized step sequence
+    frozen           TEXT NOT NULL,     -- frozen bundle/manifest/summaries
+    initial_health   TEXT NOT NULL,     -- deterministic {target_id: bool}
+    version          INTEGER NOT NULL DEFAULT 1,  -- optimistic token; bumps
+                                                  -- on archive and run create
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    archived_at      REAL,
+    updated_at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_drill_plans_created ON drill_plans(created_at, id);
+CREATE INDEX IF NOT EXISTS idx_drill_plans_status ON drill_plans(status);
+
+CREATE TABLE IF NOT EXISTS plan_runs (
+    id               TEXT PRIMARY KEY,
+    plan_id          TEXT NOT NULL,
+    status           TEXT NOT NULL,     -- ready|running|paused|completed
+    owner_id         TEXT NOT NULL,     -- identity allowed to read/operate
+    note             TEXT NOT NULL DEFAULT '',
+    base_sim_time    REAL NOT NULL,     -- per-run simulated clock anchor
+    branch_point_seq INTEGER NOT NULL DEFAULT 0,  -- >0 for branches
+    parent_run_id    TEXT,
+    parent_run_epoch INTEGER,
+    spec             TEXT NOT NULL,     -- this run's (possibly replaced) steps
+    health           TEXT NOT NULL,     -- private simulated health set
+    cache_state      TEXT NOT NULL,     -- private serialized simulated cache
+    current_seq      INTEGER NOT NULL DEFAULT 0,
+    last_sim_time    REAL,
+    run_epoch        INTEGER NOT NULL DEFAULT 1,  -- bumps on reset
+    version          INTEGER NOT NULL DEFAULT 1,  -- optimistic token
+    created_by       TEXT,
+    created_at       REAL NOT NULL,
+    started_at       REAL,
+    paused_at        REAL,
+    completed_at     REAL,
+    updated_at       REAL NOT NULL,
+    FOREIGN KEY(plan_id) REFERENCES drill_plans(id)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_runs_plan ON plan_runs(plan_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plan_runs_owner ON plan_runs(owner_id);
+CREATE INDEX IF NOT EXISTS idx_plan_runs_status ON plan_runs(status);
+CREATE INDEX IF NOT EXISTS idx_plan_runs_parent ON plan_runs(parent_run_id);
+
+-- Recorded steps of a run. 'inherited' rows are the branch's read-only
+-- prefix, frozen copies of the parent's results (including the full private
+-- cache state needed to continue replay after the branch point); 'recorded'
+-- rows are the run's own executed steps.
+CREATE TABLE IF NOT EXISTS plan_run_steps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL,
+    run_epoch   INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'recorded',  -- recorded|inherited
+    spec        TEXT NOT NULL,
+    result      TEXT NOT NULL,
+    started_at  REAL NOT NULL,
+    recorded_at REAL NOT NULL,
+    actor       TEXT,
+    UNIQUE(run_id, run_epoch, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_run_steps_run
+    ON plan_run_steps(run_id, run_epoch, seq);
+
+-- Append-only audit trail for plans and runs, fully separate from both the
+-- real audit table and the drill-only audit table.
+CREATE TABLE IF NOT EXISTS plan_audit (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT,
+    run_id  TEXT,
+    ts      REAL NOT NULL,
+    actor   TEXT,
+    action  TEXT NOT NULL,
+    version INTEGER,
+    details TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_plan_audit_plan ON plan_audit(plan_id, id);
+CREATE INDEX IF NOT EXISTS idx_plan_audit_run ON plan_audit(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_plan_audit_ts ON plan_audit(ts, id);
+
+-- Identity-scoped idempotency keys for plan/run creation, archival and
+-- branching (operations with no run epoch of their own).
+CREATE TABLE IF NOT EXISTS plan_idempotency (
+    idem_key    TEXT PRIMARY KEY,
+    identity_id TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    response    TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+
+-- Idempotency keys scoped per (run, run_epoch): reset starts a new epoch so
+-- a retried key can never resurrect a prior run's response.
+CREATE TABLE IF NOT EXISTS plan_run_idempotency (
+    run_id      TEXT NOT NULL,
+    run_epoch   INTEGER NOT NULL,
+    idem_key    TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    response    TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (run_id, run_epoch, idem_key)
+);
+
+-- One frozen report per (run, run_epoch); reset removes the row.
+CREATE TABLE IF NOT EXISTS plan_run_reports (
+    run_id     TEXT PRIMARY KEY,
+    run_epoch  INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    content    TEXT NOT NULL,
+    checksum   TEXT NOT NULL
+);
+
+-- Frozen pair-wise comparison reports. The natural key is the unordered run
+-- pair: the first comparison of a pair pins both runs to the versions they
+-- held at that moment, and every repeat for the same pair replays that one
+-- stored report (regardless of request direction or later progress).
+CREATE TABLE IF NOT EXISTS plan_run_comparisons (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id_low       TEXT NOT NULL,
+    run_id_high      TEXT NOT NULL,
+    run_low_version  INTEGER NOT NULL,
+    run_high_version INTEGER NOT NULL,
+    created_at       REAL NOT NULL,
+    content          TEXT NOT NULL,
+    checksum         TEXT NOT NULL,
+    UNIQUE(run_id_low, run_id_high)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_comparisons_pair
+    ON plan_run_comparisons(run_id_low, run_id_high);
 """
 
 
