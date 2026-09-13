@@ -357,6 +357,98 @@ CREATE TABLE IF NOT EXISTS budget_usage_projections (
 );
 CREATE INDEX IF NOT EXISTS idx_projections_tenant
     ON budget_usage_projections(tenant, period_start);
+
+-- ======================================================================
+-- Fault drills (resolution replay)
+--
+-- A drill freezes one saved config version (target manifest + rule summary
+-- + full bundle payload) and a client request sequence, then replays the
+-- resolver step by step inside a private space: every step uses its own
+-- health registry, resolution cache and clock. The live health view,
+-- resolution cache, rate-limit buckets and the real audit log are never
+-- touched. All drill state lives here and therefore survives restarts.
+-- ======================================================================
+CREATE TABLE IF NOT EXISTS drills (
+    id             TEXT PRIMARY KEY,
+    status         TEXT NOT NULL,          -- ready|running|paused|completed|rejected
+    config_version INTEGER NOT NULL,       -- frozen saved config version
+    base_sim_time  REAL NOT NULL,          -- simulated clock anchor at creation
+    spec           TEXT NOT NULL,          -- frozen creation spec (steps, ...)
+    frozen         TEXT NOT NULL,          -- frozen manifest/rule summary/bundle
+    health         TEXT NOT NULL,          -- current simulated health set {id: bool}
+    cache_state    TEXT NOT NULL,          -- serialized simulated cache entries
+    current_seq    INTEGER NOT NULL DEFAULT 0,  -- last recorded step number
+    last_sim_time  REAL,                          -- simulated clock of the last step
+    run_epoch      INTEGER NOT NULL DEFAULT 1,  -- bumps on reset (invalidates old keys)
+    version        INTEGER NOT NULL DEFAULT 1,  -- optimistic-concurrency token
+    created_by     TEXT,
+    created_at     REAL NOT NULL,
+    started_at     REAL,
+    paused_at      REAL,
+    completed_at   REAL,
+    rejection      TEXT,                   -- {code,detail} when status='rejected'
+    updated_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_drills_created ON drills(created_at, id);
+CREATE INDEX IF NOT EXISTS idx_drills_status ON drills(status);
+
+-- One row per *recorded* (committed) step, in step order. Refused attempts
+-- do not consume a step number; they are kept in drill_audit instead, so
+-- the same seq can be retried after the caller fixes the payload.
+CREATE TABLE IF NOT EXISTS drill_steps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    drill_id    TEXT NOT NULL,
+    run_epoch   INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,
+    spec        TEXT NOT NULL,             -- the committed step spec
+    result      TEXT NOT NULL,             -- full recorded step result
+    started_at  REAL NOT NULL,             -- wall-clock step start
+    recorded_at REAL NOT NULL,
+    actor       TEXT,
+    UNIQUE(drill_id, run_epoch, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_drill_steps_drill
+    ON drill_steps(drill_id, run_epoch, seq);
+
+-- Append-only drill audit, fully separate from the real ``audit`` table.
+-- Covers lifecycle transitions and every explicit refusal.
+CREATE TABLE IF NOT EXISTS drill_audit (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    drill_id TEXT,
+    ts      REAL NOT NULL,
+    actor   TEXT,
+    action  TEXT NOT NULL,
+    version INTEGER,
+    details TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_drill_audit_drill ON drill_audit(drill_id, id);
+CREATE INDEX IF NOT EXISTS idx_drill_audit_ts ON drill_audit(ts, id);
+
+-- Idempotency keys scoped per (drill, run_epoch). A reset starts a new
+-- epoch, so a key retried after restart/replay cannot resurrect a result
+-- from a previous run; keys also never cross between drills.
+CREATE TABLE IF NOT EXISTS drill_idempotency (
+    drill_id    TEXT NOT NULL,
+    run_epoch   INTEGER NOT NULL,
+    idem_key    TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    response    TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (drill_id, run_epoch, idem_key)
+);
+
+-- At most one report per (drill, run_epoch). The content is frozen when
+-- first generated and addressed by its checksum; reset clears the row so a
+-- replayed drill produces a fresh report.
+CREATE TABLE IF NOT EXISTS drill_reports (
+    drill_id   TEXT PRIMARY KEY,
+    run_epoch  INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    content    TEXT NOT NULL,
+    checksum   TEXT NOT NULL
+);
 """
 
 

@@ -92,10 +92,29 @@ resolution; closed periods keep the frozen policy snapshot recorded for
 them. Groups and migrations require global budget:write; override requests
 and decisions require budget:write on the tenant, and a different
 administrator than the requester must decide.
+
+Fault drills (isolated resolution replay, global drill:read/drill:write):
+  POST   /v1/drills                            - freeze a saved config version
+                                                 (manifest/rule summary/request
+                                                 sequence) into a new drill
+  GET    /v1/drills                            - list drills
+  GET    /v1/drills/{id}                       - drill detail
+  POST   /v1/drills/{id}/advance               - replay the next step
+  POST   /v1/drills/{id}/pause | /resume | /reset
+  GET    /v1/drills/{id}/steps/{seq}           - one recorded step
+  POST   /v1/drills/{id}/report                - frozen read-only report
+  GET    /v1/drills-audit                      - drill-only audit trail
+
+Each replay runs the production Resolver against a private frozen snapshot,
+private health registry, private simulated-clock cache and a null audit
+sink: the live health view, resolution cache, rate-limit buckets, metering
+and the real audit log are never touched. Drill state, steps, per-(drill,
+run-epoch) idempotency keys and one-shot reports are all SQLite-persisted.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -140,6 +159,15 @@ from .disputes import (
     DisputeStore,
     DisputeSubmitRequest,
     DISPUTE_STATUSES,
+)
+from .drills import (
+    AdvanceIn,
+    DrillConflict,
+    DrillCreateIn,
+    DrillNotFound,
+    DrillStore,
+    DrillValidation,
+    TransitionIn,
 )
 from .health import HealthChecker, HealthRegistry
 from .metering import (
@@ -399,6 +427,7 @@ class Components:
         self.rate_limiter = RateLimiter(self.audit, time.time)
         self.metering = MeteringStore(db, self.audit, time.time)
         self.disputes = DisputeStore(db, self.metering, self.audit, time.time)
+        self.drills = DrillStore(db, self.config, self.health, time.time)
         self.config.add_listener(
             self.rate_limiter.replace_buckets,
             self.rate_limiter.preview_replace,
@@ -522,6 +551,30 @@ def create_app(components: Components) -> FastAPI:
     @app.exception_handler(MeteringValidationError)
     async def _metering_validation(_req, exc: MeteringValidationError):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.exception_handler(DrillNotFound)
+    async def _drill_not_found(_req, exc: DrillNotFound):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(DrillConflict)
+    async def _drill_conflict(_req, exc: DrillConflict):
+        # Semantic refusals (unknown frozen targets, step gaps, illegal
+        # health changes, state/version conflicts) are already recorded in
+        # the drill-only audit log by the store.
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+    @app.exception_handler(DrillValidation)
+    async def _drill_validation(_req, exc: DrillValidation):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": str(exc), "code": exc.code},
+        )
 
     @app.exception_handler(PolicyDenied)
     async def _policy_denied(_req, exc: PolicyDenied):
@@ -2066,6 +2119,160 @@ def create_app(components: Components) -> FastAPI:
             projection["policy_origin"] = status["policy_origin"]
             projection["frozen"] = status["frozen"]
         return projection
+
+    # -- fault drills (isolated resolution replay) ------------------------
+
+    def authorize_drill(caller: Caller, action: str) -> None:
+        """Drills replay a full global config snapshot: global scope only."""
+        comp.authz.authorize(caller, action, [Scope()])
+
+    def drill_fingerprint(body: dict) -> str:
+        return hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+
+    @app.post("/v1/drills", status_code=201)
+    async def create_drill(
+        req: DrillCreateIn,
+        caller: Caller = Depends(authenticated),
+    ):
+        # Creation runs its own validation-and-audit inside the store
+        # (refusals are written to the drill-only audit log), so authorize
+        # first and let the store translate validation into precise codes.
+        authorize_drill(caller, "drill:write")
+        drill = comp.drills.create(req, actor=caller.identity_id)
+        return {"drill": comp.drills.get(drill["id"])}
+
+    @app.get("/v1/drills")
+    async def list_drills(
+        status: Optional[str] = Query(default=None),
+        config_version: Optional[int] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        drills = comp.drills.list_drills(
+            status=status, config_version=config_version, limit=limit
+        )
+        return {"drills": drills, "count": len(drills)}
+
+    @app.get("/v1/drills/{drill_id}")
+    async def get_drill(
+        drill_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_drill(caller, "drill:read")
+        return {"drill": comp.drills.get(drill_id)}
+
+    @app.post("/v1/drills/{drill_id}/advance")
+    async def advance_drill(
+        drill_id: str,
+        req: AdvanceIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        status_code, payload = comp.drills.advance(
+            drill_id,
+            req,
+            actor=caller.identity_id,
+            idem_key=idempotency_key,
+            fingerprint=drill_fingerprint(req.model_dump()) if idempotency_key else None,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/drills/{drill_id}/pause")
+    async def pause_drill(
+        drill_id: str,
+        req: TransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        status_code, payload = comp.drills.pause(
+            drill_id,
+            actor=caller.identity_id,
+            expected_version=req.expected_version,
+            reason=req.reason,
+            idem_key=idempotency_key,
+            fingerprint=drill_fingerprint(req.model_dump()) if idempotency_key else None,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/drills/{drill_id}/resume")
+    async def resume_drill(
+        drill_id: str,
+        req: TransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        status_code, payload = comp.drills.resume(
+            drill_id,
+            actor=caller.identity_id,
+            expected_version=req.expected_version,
+            reason=req.reason,
+            idem_key=idempotency_key,
+            fingerprint=drill_fingerprint(req.model_dump()) if idempotency_key else None,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/v1/drills/{drill_id}/reset")
+    async def reset_drill(
+        drill_id: str,
+        req: TransitionIn,
+        caller: Caller = Depends(authenticated),
+        idempotency_key: Optional[str] = Header(
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        authorize_drill(caller, "drill:write")
+        status_code, payload = comp.drills.reset(
+            drill_id,
+            actor=caller.identity_id,
+            expected_version=req.expected_version,
+            reason=req.reason,
+            idem_key=idempotency_key,
+            fingerprint=drill_fingerprint(req.model_dump()) if idempotency_key else None,
+        )
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.get("/v1/drills/{drill_id}/steps/{seq}")
+    async def get_drill_step(
+        drill_id: str,
+        seq: int,
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        return {"drill_id": drill_id, "step": comp.drills.step(drill_id, seq)}
+
+    @app.post("/v1/drills/{drill_id}/report")
+    async def drill_report(
+        drill_id: str, caller: Caller = Depends(authenticated)
+    ):
+        authorize_drill(caller, "drill:read")
+        # Read-only: generated once per run, then frozen and replayed
+        # identically (same content and checksum) for every repeat.
+        return comp.drills.report(drill_id)
+
+    @app.get("/v1/drills-audit")
+    async def drills_audit(
+        drill_id: Optional[str] = Query(default=None),
+        action: Optional[str] = Query(default=None),
+        since: Optional[float] = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=2000),
+        caller: Caller = Depends(authenticated),
+    ):
+        authorize_drill(caller, "drill:read")
+        records = comp.drills.drill_audit(
+            drill_id, action=action, since=since, limit=limit
+        )
+        return {"records": records, "count": len(records)}
 
     # -- admin delegation ----------------------------------------------------
 

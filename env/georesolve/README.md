@@ -287,7 +287,7 @@
 动作集合：`config:read`、`config:write`、`versions:read`、`cache:read`、`cache:flush`、
 `health:read`、`health:write`、`audit:read`、`admin:manage`、
 `metering:read`、`metering:backfill`、`metering:recompute`、
-`budget:read`、`budget:write`。每个控制面请求先认证
+`budget:read`、`budget:write`、`drill:read`、`drill:write`。每个控制面请求先认证
 （失败 **401**），再按动作与资源作用域授权（越权 **403**，且授权在任何变更之前完成，
 **被拒绝的请求不会产生配置或缓存副作用**）。允许与拒绝都写入审计
 （`authz_decision` / `authz_denied`）。
@@ -359,6 +359,79 @@
   行为不变；身份令牌与 bootstrap 令牌可同时使用。
 - 未设置令牌且没有任何身份：控制面保持开放（开发模式）；**一旦创建第一个身份即强制
   认证**，匿名请求得到 401。
+
+## 隔离故障演练与解析回放（fault drills）
+
+管理员可针对**某个已保存配置版本**创建故障演练，冻结创建时刻的目标清单、规则摘要
+与客户端请求序列，然后一步步在**私有空间**里重放真实解析逻辑。
+
+### 创建即冻结
+- `POST /v1/drills`（体含 `config_version`、`steps[]`、可选 `initial_health`、
+  `drill_id`、`description`）。创建时从 `config_versions` 取回该版本的**全量 bundle**
+  并冻结：配置版本与完整载荷、**目标清单**（该版本所有规则/发布组引用的目标 id，去重）、
+  **规则摘要**（按 `(name, scope, region, tenant)` 的规则/发布组/限流档位摘要）、
+  有序编号的**客户端请求序列**、初始模拟健康集合（线上健康视图叠加调用方覆盖）与固定的
+  模拟时钟锚点。
+- 明确拒绝（均写**演练审计** `drill_audit`，不创建可用演练）：配置版本不存在
+  （**404** `config_version_not_found`）、步骤健康变化或初始健康引用的目标不在冻结清单
+  （409 `target_not_in_frozen_manifest`）、健康值非法（409 `illegal_health_change`）、
+  空步骤序列（422）。
+
+### 严格隔离（绝不触碰线上）
+- 每一步用**生产 `Resolver`** 跑，但协作者全部私有：由冻结 bundle 重建的
+  `Snapshot`（绝不读线上 ConfigManager）、演练私有模拟健康注册表、模拟时钟上的演练私有
+  `ResolutionCache`；**不挂限流、不挂计量**（不扣令牌、不产生用量事件、不跑预算闸门）。
+- 重放内部审计（`release_group_hit`/缓存失效）进 **null 审计**丢弃；演练生命周期与拒绝
+  事件进独立的 `drill_audit` 表（**绝不写真实 `audit`**）。
+- 因此演练可以任意改健康、老化缓存、重复回放，线上健康视图、解析缓存、限流桶与真实审计
+  都不受影响；不同演练之间状态也互不串用。
+
+### 步骤推进与生命周期
+- 状态机：`ready → running ⇄ paused → completed`。创建为 `ready`；`resume` 启动
+  （`ready → running`，也是暂停后的继续），`pause` 挂起，推进到最后一步转 `completed`。
+- `POST /v1/drills/{id}/advance`（体可选 `seq`、`expected_version`）按序推进下一步；
+  步骤在创建时冻结，每步可指定 `health_changes`（推进前施加的目标健康变化）、请求参数
+  （name/region/tenant/client/labels）与 `expected`（预期 `chosen`/`status`/`order`/
+  `degraded`）以及模拟时间（绝对 `at` 或相对上一步的 `advance_seconds`，缺省用创建锚点，
+  保证回放确定）。
+- 每步记录：`started_at`（墙钟开始时间）、`input`（请求、推进前健康、缓存键等输入快照）、
+  `health_after`（模拟后的完整健康集合）、`answer`（解析结果）、`order`（目标排序）、
+  `cache_hit`（是否命中**模拟**缓存）、`expected`、`matched_expected`、`diffs` 与
+  `diff_reasons`（与预期的逐字段差异原因）。
+- 明确拒绝并写演练审计：步骤序号跳跃（409 `step_sequence_gap`）、暂停/完成态推进
+  （409 `status_conflict`）、`expected_version` 不符（409 `expected_version`）。
+  失败的推进**不占用**步骤号，修正后可按同一序号重试。
+- `POST .../pause`、`.../resume`、`.../reset`：重置清空已记录步骤、模拟缓存与报告，
+  以**新的 run epoch** 回到 `ready`，上一 epoch 的幂等键不再能重放旧结果。
+- 步骤推进/暂停/恢复/重置均支持 `expected_version` 乐观并发与 `Idempotency-Key`：
+  幂等键按 `(演练, run_epoch)` 隔离，重复提交只重放同一结果（`idempotent_replay:true`，
+  不重复写步骤/版本/审计），同键不同载荷 409；并发推进同一步骤在锁与状态机下只有一方成功。
+
+### 只读报告
+- `POST /v1/drills/{id}/report`（读权限即可）：报告内容在每个 run 内**只生成一次**，
+  此后重复生成只返回同一份内容与同一 `checksum`（blake2b，`idempotent_replay:true`）。
+- 报告固定**创建时的演练快照**（目标清单、规则/发布组/限流摘要），逐步给出预期与实际
+  选择、命中缓存与否、模拟健康，并以 `first_diff` 指出**首个**差异步骤；reset 后重新
+  生成全新 run 的报告。
+
+### 持久化
+- 演练、步骤结果、独立演练审计、演练级幂等与报告全部落 SQLite；服务重启后演练状态、
+  步骤结果、版本冲突判定、报告校验值与审计追加顺序保持一致。
+
+### 接口
+- 演练冻结的是**全量配置快照**，因此 `drill:read`/`drill:write` 仅 **global** 作用域可用
+  （region/tenant 授权 403）。
+
+| 方法/路径 | 说明 |
+|---|---|
+| `POST /v1/drills` | 创建演练（冻结版本/清单/规则摘要/请求序列），201 |
+| `GET /v1/drills?status=&config_version=&limit=` | 演练列表 |
+| `GET /v1/drills/{id}` | 演练详情（冻结内容、当前健康、本 run 步骤与模拟缓存） |
+| `POST /v1/drills/{id}/advance` | 推进下一步（`seq`/`expected_version`，支持幂等键） |
+| `POST /v1/drills/{id}/pause` / `.../resume` / `.../reset` | 暂停 / 恢复 / 重新开始（支持幂等键） |
+| `GET /v1/drills/{id}/steps/{seq}` | 按步骤号查询单步结果 |
+| `POST /v1/drills/{id}/report` | 只读报告（每个 run 固定一份，带 checksum） |
+| `GET /v1/drills-audit?drill_id=&action=&since=&limit=` | 独立演练审计（与真实 `audit` 分离） |
 
 ## API
 

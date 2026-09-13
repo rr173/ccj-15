@@ -999,6 +999,11 @@ class ConfigManager:
 
     # -- history ----------------------------------------------------------
 
+    def saved_bundle(self, version: int) -> ConfigBundle:
+        """The full-state bundle persisted for ``version`` (or VersionNotFound)."""
+        bundle, _row = self._load_saved(version)
+        return bundle
+
     def versions(self, limit: int = 50) -> list[dict]:
         """Saved version summaries, newest first (without full payloads)."""
         rows = self._conn.execute(

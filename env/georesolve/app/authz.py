@@ -83,6 +83,8 @@ ACTIONS = frozenset(
         "metering:recompute",
         "budget:read",
         "budget:write",
+        "drill:read",
+        "drill:write",
     }
 )
 
