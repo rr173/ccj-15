@@ -1006,6 +1006,96 @@ CREATE TABLE IF NOT EXISTS alert_drill_reports (
     checksum   TEXT NOT NULL,
     UNIQUE(drill_id, run_epoch)
 );
+
+-- Delivery-edge snapshot cache for the alert outbox. The ingestor stamps new
+-- deliveries with the subscription snapshot memoized per (sub_id, sub_version);
+-- every version change (update, delete or an applied policy proposal)
+-- invalidates the old version's rows in the same transaction, so new events
+-- always pick up the new policy while already-generated deliveries keep their
+-- own frozen snapshot untouched.
+CREATE TABLE IF NOT EXISTS health_alert_delivery_cache (
+    sub_id            TEXT NOT NULL,
+    sub_version       INTEGER NOT NULL,
+    snapshot          TEXT NOT NULL,
+    deliveries_served INTEGER NOT NULL DEFAULT 0,
+    created_at        REAL NOT NULL,
+    invalidated_at    REAL,
+    invalidate_reason TEXT,
+    PRIMARY KEY (sub_id, sub_version)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_cache_sub
+    ON health_alert_delivery_cache(sub_id, invalidated_at);
+
+-- ======================================================================
+-- Drill-result-driven alert policy change proposals (approval gate)
+--
+-- A proposal is created from a COMPLETED alert drill's frozen diff report
+-- and carries, frozen at creation time: the report checksum (plus the drill
+-- run epoch it belongs to), the live subscription version, the full
+-- to-be-applied silence-window/retry parameter set and a human summary.
+-- Lifecycle:
+--   pending -> approved -> applied
+--           \-> rejected
+--   pending/approved -> revoked
+--   pending/approved -> expired   (lazy, persisted when noticed)
+-- Approval/rejection requires a DIFFERENT authorized administrator than the
+-- requester. Applying re-checks (in one transaction) that the live
+-- subscription is still at the frozen version, the drill report was not
+-- reset and the frozen parameters still pass subscription validation, then
+-- bumps the subscription version and invalidates the old delivery cache
+-- atomically; any check failure refuses the whole apply.
+-- ======================================================================
+CREATE TABLE IF NOT EXISTS alert_policy_proposals (
+    id               TEXT PRIMARY KEY,
+    status           TEXT NOT NULL,          -- pending|approved|rejected|applied|revoked|expired
+    drill_id         TEXT NOT NULL,
+    run_epoch        INTEGER NOT NULL,       -- drill epoch the frozen report belongs to
+    report_checksum  TEXT NOT NULL,          -- frozen drill report checksum
+    sub_id           TEXT NOT NULL,
+    sub_version      INTEGER NOT NULL,       -- live subscription version at creation
+    changes          TEXT NOT NULL,          -- full frozen parameter set (JSON)
+    summary          TEXT NOT NULL,
+    version          INTEGER NOT NULL DEFAULT 1,  -- optimistic-concurrency token
+    created_by       TEXT NOT NULL,
+    created_at       REAL NOT NULL,
+    expires_at       REAL NOT NULL,
+    decided_by       TEXT,
+    decided_at       REAL,
+    decision_comment TEXT,
+    applied_by       TEXT,
+    applied_at       REAL,
+    applied_sub_version INTEGER,             -- subscription version produced by apply
+    revoked_by       TEXT,
+    revoked_at       REAL,
+    revoke_reason    TEXT,
+    updated_at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_proposals_status
+    ON alert_policy_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_alert_proposals_sub
+    ON alert_policy_proposals(sub_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_alert_proposals_drill
+    ON alert_policy_proposals(drill_id);
+
+-- Append-only proposal audit: every lifecycle transition and every explicit
+-- refusal appends exactly one row (never updated or deleted), so the
+-- approval chain, the apply version and the refusal reasons survive
+-- restarts in their original order.
+CREATE TABLE IF NOT EXISTS alert_policy_proposal_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id TEXT,
+    ts          REAL NOT NULL,
+    actor       TEXT,
+    action      TEXT NOT NULL,
+    from_status TEXT,
+    to_status   TEXT,
+    version     INTEGER,
+    details     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_alert_proposal_events
+    ON alert_policy_proposal_events(proposal_id, id);
+CREATE INDEX IF NOT EXISTS idx_alert_proposal_events_ts
+    ON alert_policy_proposal_events(ts, id);
 """
 
 

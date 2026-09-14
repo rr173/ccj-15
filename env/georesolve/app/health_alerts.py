@@ -340,6 +340,11 @@ class AlertStore:
         self._sender = sender or default_webhook_sender
         self._send_timeout = send_timeout
 
+    @property
+    def lock(self) -> threading.RLock:
+        """Shared mutation lock (proposal application serializes on it too)."""
+        return self._lock
+
     # -- target helpers ------------------------------------------------------
 
     def _validate_target(self, target_id: str) -> None:
@@ -499,6 +504,10 @@ class AlertStore:
                     " updated_at = ? WHERE sub_id = ? AND status = ?",
                     (ST_SUPERSEDED, now, sub_id, ST_UNCONFIRMED),
                 )
+            # The old revision's delivery-edge cache is stale from here on.
+            self.invalidate_delivery_cache_locked(
+                sub_id, reason="subscription_updated", now=now
+            )
             self._append_revision(sub_id, version, "updated", req, actor, now)
             self._conn.commit()
             self._audit.record(
@@ -559,6 +568,9 @@ class AlertStore:
                 "UPDATE health_alert_deliveries SET status = ?,"
                 " updated_at = ? WHERE sub_id = ? AND status = ?",
                 (ST_SUPERSEDED, now, sub_id, ST_UNCONFIRMED),
+            )
+            self.invalidate_delivery_cache_locked(
+                sub_id, reason="subscription_deleted", now=now
             )
             self._conn.execute(
                 "INSERT INTO health_alert_sub_revisions"
@@ -776,7 +788,9 @@ class AlertStore:
                 (
                     f"hdel-{event_uid}-{s['sub_id']}", event_id, s["sub_id"],
                     s["sub_version"],
-                    json.dumps(self._snapshot_payload(sub), sort_keys=True),
+                    json.dumps(
+                        self._cached_snapshot_locked(sub), sort_keys=True
+                    ),
                     s["signing_secret"],
                     json.dumps(payload, sort_keys=True), status, 0,
                     s["max_retries"], next_at, None, None, None, now, now,
@@ -807,6 +821,90 @@ class AlertStore:
             "backoff_base_seconds": sub["backoff_base_seconds"],
             "backoff_max_seconds": sub["backoff_max_seconds"],
         }
+
+    # -- delivery-edge snapshot cache -----------------------------------------
+
+    def _cached_snapshot_locked(self, sub: dict) -> dict:
+        """Snapshot for stamping new deliveries, memoized per (sub, version).
+
+        The delivery edge caches the subscription snapshot of the current
+        revision instead of rebuilding it for every matching transition.
+        Because the cache key includes ``sub_version``, a version bump can
+        never serve stale content; the old version's rows are additionally
+        marked invalidated (same transaction as the bump) so the gate's
+        "invalidate affected old delivery caches" step is observable and
+        audited. Already-generated deliveries never read this cache: they
+        carry their own frozen snapshot column.
+        """
+        row = self._conn.execute(
+            "SELECT snapshot FROM health_alert_delivery_cache"
+            " WHERE sub_id = ? AND sub_version = ? AND invalidated_at IS NULL",
+            (sub["sub_id"], sub["sub_version"]),
+        ).fetchone()
+        if row is not None:
+            self._conn.execute(
+                "UPDATE health_alert_delivery_cache"
+                " SET deliveries_served = deliveries_served + 1"
+                " WHERE sub_id = ? AND sub_version = ?",
+                (sub["sub_id"], sub["sub_version"]),
+            )
+            return json.loads(row["snapshot"])
+        snap = self._snapshot_payload(sub)
+        self._conn.execute(
+            "INSERT INTO health_alert_delivery_cache"
+            " (sub_id, sub_version, snapshot, deliveries_served, created_at)"
+            " VALUES (?, ?, ?, 1, ?)"
+            " ON CONFLICT(sub_id, sub_version) DO UPDATE SET"
+            " snapshot = excluded.snapshot,"
+            " deliveries_served = deliveries_served + 1,"
+            " invalidated_at = NULL, invalidate_reason = NULL",
+            (
+                sub["sub_id"], sub["sub_version"],
+                json.dumps(snap, sort_keys=True), self._clock(),
+            ),
+        )
+        return snap
+
+    def invalidate_delivery_cache_locked(
+        self, sub_id: str, *, reason: str, now: Optional[float] = None
+    ) -> int:
+        """Invalidate every active cached snapshot of a subscription.
+
+        Caller must hold the lock and runs inside the version-change
+        transaction; returns the number of cache rows invalidated.
+        """
+        now = self._clock() if now is None else now
+        cur = self._conn.execute(
+            "UPDATE health_alert_delivery_cache"
+            " SET invalidated_at = ?, invalidate_reason = ?"
+            " WHERE sub_id = ? AND invalidated_at IS NULL",
+            (now, reason, sub_id),
+        )
+        return cur.rowcount
+
+    def delivery_cache_entries(self, sub_id: Optional[str] = None) -> list[dict]:
+        """Read view over the delivery-edge cache (newest versions first)."""
+        sql = "SELECT * FROM health_alert_delivery_cache"
+        args: list = []
+        if sub_id is not None:
+            sql += " WHERE sub_id = ?"
+            args.append(sub_id)
+        sql += " ORDER BY sub_id ASC, sub_version DESC"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            {
+                "sub_id": r["sub_id"],
+                "sub_version": r["sub_version"],
+                "snapshot": json.loads(r["snapshot"]),
+                "deliveries_served": r["deliveries_served"],
+                "created_at": r["created_at"],
+                "invalidated_at": r["invalidated_at"],
+                "invalidate_reason": r["invalidate_reason"],
+                "active": r["invalidated_at"] is None,
+            }
+            for r in rows
+        ]
 
     def _build_payload(self, ev: dict, sub: dict) -> dict:
         return {
